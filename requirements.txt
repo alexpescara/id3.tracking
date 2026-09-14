@@ -1,0 +1,8 @@
+beautifulsoup4>=4.12,<5
+lxml>=5.0,<7
+playwright>=1.50,<2
+PyYAML>=6.0,<7
+pandas>=2.2,<3
+pydantic>=2.8,<3
+python-dateutil>=2.9,<3
+pytest>=8,<9

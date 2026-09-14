@@ -1,0 +1,21 @@
+project:
+  name: id3-market-monitor
+  timezone: Europe/Rome
+
+scraper:
+  headless: true
+  timeout_ms: 30000
+  delay_seconds: 2.5
+  max_pages: 3
+  user_agent: "ID3-Market-Monitor/0.1 (open-source research project)"
+
+filters:
+  min_year: 2024
+  min_battery_kwh: 58
+  max_price_eur: 30000
+
+sources:
+  autoscout24:
+    enabled: true
+    # Inserire una URL di ricerca pubblica verificata e compatibile
+    search_url: "https://www.autoscout24.it/lst/volkswagen/id.3?atype=C&cy=I&damaged_listing=exclude&desc=0&fregfrom=2024&powertype=kw&search_id=example"

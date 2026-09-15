@@ -858,10 +858,9 @@ class AutoScout24Scraper:
         listing: dict[str, Any],
         detail: dict[str, Any],
     ) -> None:
-
-        # Il dato della lista rimane prioritario se già
-        # disponibile e plausibile.
-
+    
+        # La pagina dettaglio è considerata più affidabile
+        # della card risultati per i dati tecnici.
         for field in [
             "price_eur",
             "mileage_km",
@@ -869,59 +868,41 @@ class AutoScout24Scraper:
             "battery_kwh",
             "power_hp",
         ]:
-            current = listing.get(
-                field
-            )
-
-            new_value = detail.get(
-                field
-            )
-
-            if self._is_empty_value(
-                current
-            ) and not self._is_empty_value(
-                new_value
-            ):
+            new_value = detail.get(field)
+    
+            if not self._is_empty_value(new_value):
                 listing[field] = new_value
-
-        # Titolo: preferiamo quello del dettaglio se più ricco.
-        detail_title = detail.get(
-            "title"
-        )
-
-        current_title = listing.get(
-            "title"
-        )
-
-        if (
-            detail_title
-            and (
-                not current_title
-                or len(detail_title)
-                > len(current_title)
-            )
-        ):
-            listing["title"] = detail_title
-
+    
+        # Titolo: preferiamo sempre quello del dettaglio
+        # se identifica realmente una ID.3.
+        detail_title = detail.get("title")
+        current_title = listing.get("title")
+    
+        if detail_title:
+            detail_lower = detail_title.lower()
+    
+            if (
+                "id.3" in detail_lower
+                or "id 3" in detail_lower
+            ):
+                if (
+                    not current_title
+                    or len(detail_title) > len(current_title)
+                    or current_title.lower() == "volkswagen"
+                ):
+                    listing["title"] = detail_title
+    
         if detail.get("description"):
-            listing["description"] = (
-                detail["description"]
-            )
-
+            listing["description"] = detail["description"]
+    
         if detail.get("seller"):
-            listing["seller"] = (
-                detail["seller"]
-            )
-
+            listing["seller"] = detail["seller"]
+    
         if detail.get("equipment"):
-            listing["equipment"] = (
-                detail["equipment"]
-            )
-
+            listing["equipment"] = detail["equipment"]
+    
         if (
-            detail.get(
-                "infotainment_129_candidate"
-            )
+            detail.get("infotainment_129_candidate")
             is not None
         ):
             listing[
@@ -929,7 +910,7 @@ class AutoScout24Scraper:
             ] = detail[
                 "infotainment_129_candidate"
             ]
-
+    
             listing[
                 "classification_evidence"
             ] = detail.get(
@@ -1081,54 +1062,86 @@ class AutoScout24Scraper:
         soup: BeautifulSoup,
         jsonld: list[Any],
     ) -> str:
-
+    
+        generic_fragments = [
+            "trova la tua volkswagen",
+            "autoscout24",
+            "passa al contenuto principale",
+            "i miei aggiornamenti",
+            "ricerca auto",
+            "compra auto",
+            "compra auto usate",
+            "compra auto nuove",
+            "ricerca concessionari",
+        ]
+    
+        def is_valid(value: str) -> bool:
+            value = self._clean_text(value)
+    
+            if len(value) < 30:
+                return False
+    
+            lower = value.lower()
+    
+            # Evita il testo globale della pagina.
+            if sum(
+                fragment in lower
+                for fragment in generic_fragments
+            ) >= 2:
+                return False
+    
+            if len(value) > 5000:
+                return False
+    
+            return True
+    
+        # JSON-LD
         for obj in jsonld:
-
             if not isinstance(obj, dict):
                 continue
-
-            value = obj.get(
-                "description"
-            )
-
-            if isinstance(
-                value,
-                str,
-            ):
-                value = self._clean_text(
-                    value
-                )
-
-                if len(value) > 20:
+    
+            value = obj.get("description")
+    
+            if isinstance(value, str):
+                value = self._clean_text(value)
+    
+                if is_valid(value):
                     return value
-
+    
+        # Selettori specifici
         selectors = [
-            '[data-testid*="description" i]',
+            '[data-testid="description"]',
+            '[data-testid*="description"]',
+            '[aria-label*="Descrizione" i]',
             '[class*="description" i]',
         ]
-
+    
+        candidates = []
+    
         for selector in selectors:
-
             try:
-                element = soup.select_one(
-                    selector
-                )
-
-                if element:
-
-                    text = self._clean_text(
+                for element in soup.select(selector):
+                    value = self._clean_text(
                         element.get_text(
                             " ",
                             strip=True,
                         )
                     )
-
-                    if len(text) > 20:
-                        return text
-
+    
+                    if is_valid(value):
+                        candidates.append(value)
+    
             except Exception:
                 continue
-
+    
+        if candidates:
+            # Preferiamo il testo più plausibile,
+            # non necessariamente quello più lungo.
+            return min(
+                candidates,
+                key=len,
+            )
+    
         return ""
 
     def _extract_seller(
@@ -1137,65 +1150,106 @@ class AutoScout24Scraper:
         jsonld: list[Any],
         next_data: Any,
     ) -> str:
-
+    
+        # JSON-LD
         for obj in jsonld:
-
             if not isinstance(obj, dict):
                 continue
-
-            seller = obj.get(
-                "seller"
-            )
-
-            if isinstance(
-                seller,
-                dict,
-            ):
-                name = seller.get(
-                    "name"
-                )
-
-                if isinstance(
-                    name,
-                    str,
-                ):
-                    name = self._clean_text(
-                        name
-                    )
-
-                    if name:
+    
+            seller = obj.get("seller")
+    
+            if isinstance(seller, dict):
+                name = seller.get("name")
+    
+                if isinstance(name, str):
+                    name = self._clean_text(name)
+    
+                    if self._is_valid_seller(name):
                         return name
-
+    
+        # NEXT_DATA
+        for obj in self._walk_objects(next_data):
+            if not isinstance(obj, dict):
+                continue
+    
+            for key in [
+                "sellerName",
+                "dealerName",
+                "seller",
+                "dealer",
+                "companyName",
+            ]:
+                value = obj.get(key)
+    
+                if isinstance(value, dict):
+                    value = (
+                        value.get("name")
+                        or value.get("displayName")
+                    )
+    
+                if isinstance(value, str):
+                    value = self._clean_text(value)
+    
+                    if self._is_valid_seller(value):
+                        return value
+    
+        # Selettori mirati
         selectors = [
-            '[data-testid*="seller" i]',
-            '[data-testid*="dealer" i]',
-            '[class*="seller" i]',
-            '[class*="dealer" i]',
+            '[data-testid="seller"]',
+            '[data-testid="dealer"]',
+            '[data-testid*="seller-name" i]',
+            '[data-testid*="dealer-name" i]',
         ]
-
+    
         for selector in selectors:
-
             try:
-                element = soup.select_one(
-                    selector
-                )
-
-                if element:
-
-                    text = self._clean_text(
+                for element in soup.select(selector):
+                    value = self._clean_text(
                         element.get_text(
                             " ",
                             strip=True,
                         )
                     )
-
-                    if text:
-                        return text
-
+    
+                    if self._is_valid_seller(value):
+                        return value
+    
             except Exception:
                 continue
-
+    
         return ""
+    
+    
+    @staticmethod
+    def _is_valid_seller(value: str) -> bool:
+    
+        if not value:
+            return False
+    
+        if len(value) < 2:
+            return False
+    
+        if len(value) > 200:
+            return False
+    
+        lower = value.lower()
+    
+        invalid_fragments = [
+            "autoscout24",
+            "passa al contenuto",
+            "ricerca auto",
+            "compra auto",
+            "trova la tua volkswagen",
+            "i miei aggiornamenti",
+        ]
+    
+        if any(
+            fragment in lower
+            for fragment in invalid_fragments
+        ):
+            return False
+    
+        return True
 
     def _extract_seller_from_object(
         self,
@@ -1997,34 +2051,49 @@ class AutoScout24Scraper:
         self,
         text: str,
     ) -> int | None:
-
-        patterns = [
+    
+        if not text:
+            return None
+    
+        matches = re.findall(
             r'\b(\d{2,3})\s*CV\b',
-            r'\b(\d{2,3})\s*cavalli\b',
-        ]
-
-        for pattern in patterns:
-
+            text,
+            flags=re.IGNORECASE,
+        )
+    
+        values = []
+    
+        for value in matches:
+            hp = int(value)
+    
+            if 50 <= hp <= 500:
+                values.append(hp)
+    
+        if not values:
             matches = re.findall(
-                pattern,
+                r'\b(\d{2,3})\s*cavalli\b',
                 text,
                 flags=re.IGNORECASE,
             )
-
+    
             for value in matches:
-
-                hp = int(
-                    value
-                )
-
-                if (
-                    50
-                    <= hp
-                    <= 500
-                ):
-                    return hp
-
-        return None
+                hp = int(value)
+    
+                if 50 <= hp <= 500:
+                    values.append(hp)
+    
+        if not values:
+            return None
+    
+        # ID.3 Pro / Pro Performance:
+        # 204 CV è il valore che vogliamo privilegiare
+        # quando compare esplicitamente nel testo.
+        if 204 in values:
+            return 204
+    
+        # Evita di prendere automaticamente 95 CV quando
+        # nel testo sono presenti altri valori tecnici.
+        return values[0]
 
     def _parse_hp_from_object(
         self,

@@ -16,39 +16,68 @@ from .base import BaseScraper
 # Regex
 # ---------------------------------------------------------------------------
 
+# Chilometraggio scritto normalmente in italiano:
+# 26.173 km
+# 40.698 km
+# 7.910 km
+#
+# Il punto viene trattato come separatore delle migliaia.
 KM_RE = re.compile(
-    r"(\d[\d\.\s]*)\s*km\b",
+    r"\b(\d{1,3}(?:[.\s]\d{3})+|\d{4,6})\s*km\b",
+    re.IGNORECASE,
+)
+
+# Alcune pagine possono riportare anche "7910 km".
+KM_SIMPLE_RE = re.compile(
+    r"\b(\d{4,6})\s*km\b",
     re.IGNORECASE,
 )
 
 YEAR_RE = re.compile(
-    r"\b(20\d{2})\b",
+    r"\b(20\d{2})\b"
 )
 
+# Batterie tipiche ID.3.
+# Permettiamo anche valori non interi per essere più robusti.
 BATTERY_RE = re.compile(
-    r"\b(5[89]|6[0-9]|7[0-9]|8[0-9])\s*kWh\b",
+    r"\b("
+    r"5[0-9]|"
+    r"6[0-9]|"
+    r"7[0-9]|"
+    r"8[0-9]"
+    r")\s*kWh\b",
     re.IGNORECASE,
 )
 
+# Potenza espressa in CV / PS / kW.
 POWER_RE = re.compile(
-    r"\b(\d{2,3})\s*(?:CV|PS|kW)\b",
+    r"\b(\d{2,3}(?:[.,]\d+)?)\s*(CV|PS|kW)\b",
     re.IGNORECASE,
 )
 
-PRICE_RE = re.compile(
-    r"(?:€\s*)?(\d{1,3}(?:[.\s]\d{3})+|\d{4,6})(?:\s*€)?",
+# Infotainment 12,9".
+INFOTAINMENT_129_RE = re.compile(
+    r"""
+    (?:
+        \b12[\.,]\s*9\s*(?:["”“″]|pollici|inch)?
+        |
+        \b12[\.,]9\b
+        |
+        \b12\s+9\s*(?:["”“″]|pollici|inch)
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
-INFOTAINMENT_RE = re.compile(
+# Display da 12" / 12 pollici.
+INFOTAINMENT_12_RE = re.compile(
     r"""
-    (
-        12[\.,]?\s*9\s*(?:["”″]|pollici|inch)?
+    (?:
+        \b12\s*(?:["”“″]|pollici|inch)
         |
-        12[\.,]?\s*9
+        \bdisplay\s+(?:touchscreen\s+)?da\s+12
         |
-        infotainment
-        |
-        discover\s+pro
+        \bschermo\s+(?:touchscreen\s+)?da\s+12
     )
     """,
     re.IGNORECASE | re.VERBOSE,
@@ -57,39 +86,58 @@ INFOTAINMENT_RE = re.compile(
 
 class AutoScout24Scraper(BaseScraper):
     """
-    Conservative public-page scraper for AutoScout24.
+    Scraper conservativo per le pagine pubbliche di AutoScout24.
 
-    The scraper:
-    - uses the public search page;
-    - extracts structured data when available;
-    - does not bypass CAPTCHA, login, robots restrictions or anti-bot
-      mechanisms;
-    - does not use paid APIs, proxies or external scraping services.
+    Priorità:
+    1. dati strutturati (__NEXT_DATA__);
+    2. JSON-LD;
+    3. testo della pagina come fallback.
+
+    Il prezzo NON viene mai estratto genericamente dall'intero testo:
+    viene utilizzato soltanto un campo strutturato quando disponibile.
+
+    Il scraper non tenta di aggirare CAPTCHA, login o sistemi anti-bot.
     """
 
     def search(self, search_url: str) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
 
-        s_cfg = self.config["scraper"]
+        scraper_cfg = self.config["scraper"]
 
         with sync_playwright() as p:
+
             browser = p.chromium.launch(
-                headless=s_cfg.get("headless", True)
+                headless=scraper_cfg.get(
+                    "headless",
+                    True,
+                )
             )
 
             context = browser.new_context(
-                user_agent=s_cfg.get("user_agent"),
+                user_agent=scraper_cfg.get(
+                    "user_agent"
+                ),
                 locale="it-IT",
-                viewport={"width": 1440, "height": 1000},
+                viewport={
+                    "width": 1440,
+                    "height": 1000,
+                },
             )
 
             page = context.new_page()
+
             page.set_default_timeout(
-                s_cfg.get("timeout_ms", 30000)
+                scraper_cfg.get(
+                    "timeout_ms",
+                    30000,
+                )
             )
 
             try:
-                print(f"[AutoScout24] Apertura: {search_url}")
+
+                print(
+                    f"[AutoScout24] Apertura: {search_url}"
+                )
 
                 page.goto(
                     search_url,
@@ -101,10 +149,14 @@ class AutoScout24Scraper(BaseScraper):
                 self._dismiss_common_consent(page)
 
                 max_pages = int(
-                    s_cfg.get("max_pages", 1)
+                    scraper_cfg.get(
+                        "max_pages",
+                        1,
+                    )
                 )
 
                 for page_no in range(max_pages):
+
                     print(
                         f"[AutoScout24] Elaborazione pagina "
                         f"{page_no + 1}/{max_pages}"
@@ -112,9 +164,11 @@ class AutoScout24Scraper(BaseScraper):
 
                     html = page.content()
 
-                    page_results = self._parse_search_page(
-                        html,
-                        page.url,
+                    page_results = (
+                        self._parse_search_page(
+                            html,
+                            page.url,
+                        )
                     )
 
                     print(
@@ -122,7 +176,9 @@ class AutoScout24Scraper(BaseScraper):
                         f"{len(page_results)}"
                     )
 
-                    results.extend(page_results)
+                    results.extend(
+                        page_results
+                    )
 
                     if page_no + 1 >= max_pages:
                         break
@@ -136,16 +192,23 @@ class AutoScout24Scraper(BaseScraper):
                     if next_link.count() == 0:
                         break
 
-                    href = next_link.first.get_attribute("href")
+                    href = (
+                        next_link.first.get_attribute(
+                            "href"
+                        )
+                    )
 
                     if not href:
                         break
 
-                    next_url = urljoin(page.url, href)
+                    next_url = urljoin(
+                        page.url,
+                        href,
+                    )
 
                     time.sleep(
                         float(
-                            s_cfg.get(
+                            scraper_cfg.get(
                                 "delay_seconds",
                                 2.5,
                             )
@@ -160,13 +223,17 @@ class AutoScout24Scraper(BaseScraper):
                     page.wait_for_timeout(1800)
 
             finally:
+
                 context.close()
                 browser.close()
 
-        results = self._deduplicate(results)
+        results = self._deduplicate(
+            results
+        )
 
         print(
-            f"[AutoScout24] Totale annunci unici: {len(results)}"
+            f"[AutoScout24] Totale annunci unici: "
+            f"{len(results)}"
         )
 
         return results
@@ -177,6 +244,7 @@ class AutoScout24Scraper(BaseScraper):
 
     @staticmethod
     def _dismiss_common_consent(page) -> None:
+
         selectors = [
             'button:has-text("Accetta tutto")',
             'button:has-text("Accetta")',
@@ -185,12 +253,23 @@ class AutoScout24Scraper(BaseScraper):
         ]
 
         for selector in selectors:
+
             try:
-                locator = page.locator(selector)
+
+                locator = page.locator(
+                    selector
+                )
 
                 if locator.count():
-                    locator.first.click(timeout=1500)
-                    page.wait_for_timeout(500)
+
+                    locator.first.click(
+                        timeout=1500
+                    )
+
+                    page.wait_for_timeout(
+                        500
+                    )
+
                     break
 
             except Exception:
@@ -206,50 +285,71 @@ class AutoScout24Scraper(BaseScraper):
         source_url: str,
     ) -> list[dict[str, Any]]:
 
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(
+            html,
+            "lxml",
+        )
 
         cards: list[dict[str, Any]] = []
 
-        # --------------------------------------------------------------
+        # ==============================================================
         # 1. __NEXT_DATA__
-        #
-        # AutoScout24 utilizza dati strutturati lato client. Cerchiamo
-        # ricorsivamente gli oggetti che sembrano rappresentare annunci.
-        # --------------------------------------------------------------
+        # ==============================================================
 
-        next_data = self._extract_next_data(soup)
+        next_data = (
+            self._extract_next_data(
+                soup
+            )
+        )
 
         if next_data is not None:
-            next_candidates = self._find_listing_objects(
-                next_data
+
+            candidates = (
+                self._find_listing_objects(
+                    next_data
+                )
             )
 
-            for obj in next_candidates:
-                parsed = self._from_structured_object(
-                    obj,
-                    source_url,
+            print(
+                f"[AutoScout24] Oggetti strutturati trovati: "
+                f"{len(candidates)}"
+            )
+
+            for obj in candidates:
+
+                parsed = (
+                    self._from_structured_object(
+                        obj,
+                        source_url,
+                    )
                 )
 
                 if parsed.get("url"):
-                    cards.append(parsed)
+                    cards.append(
+                        parsed
+                    )
 
-        # --------------------------------------------------------------
+        # ==============================================================
         # 2. JSON-LD
-        # --------------------------------------------------------------
-
-        jsonld_cards = []
+        # ==============================================================
 
         for script in soup.find_all(
             "script",
             type="application/ld+json",
         ):
-            raw_script = script.string or script.get_text()
+
+            raw_script = (
+                script.string
+                or script.get_text()
+            )
 
             if not raw_script.strip():
                 continue
 
             try:
-                data = json.loads(raw_script)
+                data = json.loads(
+                    raw_script
+                )
 
             except Exception:
                 continue
@@ -262,12 +362,21 @@ class AutoScout24Scraper(BaseScraper):
 
             for obj in candidates:
 
-                if not isinstance(obj, dict):
+                if not isinstance(
+                    obj,
+                    dict,
+                ):
                     continue
 
-                obj_type = obj.get("@type")
+                obj_type = obj.get(
+                    "@type"
+                )
 
-                if isinstance(obj_type, list):
+                if isinstance(
+                    obj_type,
+                    list,
+                ):
+
                     valid_type = any(
                         x in {
                             "Car",
@@ -276,29 +385,36 @@ class AutoScout24Scraper(BaseScraper):
                         }
                         for x in obj_type
                     )
-                else:
-                    valid_type = obj_type in {
-                        "Car",
-                        "Vehicle",
-                        "Product",
-                    }
 
-                if valid_type:
-                    parsed = self._from_jsonld(
+                else:
+
+                    valid_type = (
+                        obj_type
+                        in {
+                            "Car",
+                            "Vehicle",
+                            "Product",
+                        }
+                    )
+
+                if not valid_type:
+                    continue
+
+                parsed = (
+                    self._from_jsonld(
                         obj,
                         source_url,
                     )
+                )
 
-                    if parsed.get("url"):
-                        jsonld_cards.append(parsed)
+                if parsed.get("url"):
+                    cards.append(
+                        parsed
+                    )
 
-        # JSON-LD viene usato se non abbiamo già trovato gli stessi
-        # annunci tramite __NEXT_DATA__.
-        cards.extend(jsonld_cards)
-
-        # --------------------------------------------------------------
+        # ==============================================================
         # 3. Fallback HTML
-        # --------------------------------------------------------------
+        # ==============================================================
 
         if not cards:
 
@@ -306,7 +422,12 @@ class AutoScout24Scraper(BaseScraper):
                 "a",
                 href=True,
             ):
-                href = a.get("href", "")
+
+                href = a.get(
+                    "href",
+                    "",
+                )
+
                 text = " ".join(
                     a.stripped_strings
                 )
@@ -314,7 +435,10 @@ class AutoScout24Scraper(BaseScraper):
                 if "/annunci/" not in href:
                     continue
 
-                if "id.3" not in text.lower():
+                if (
+                    "id.3"
+                    not in text.lower()
+                ):
                     continue
 
                 cards.append(
@@ -336,7 +460,10 @@ class AutoScout24Scraper(BaseScraper):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _extract_next_data(soup: BeautifulSoup):
+    def _extract_next_data(
+        soup: BeautifulSoup,
+    ):
+
         script = soup.find(
             "script",
             id="__NEXT_DATA__",
@@ -345,13 +472,18 @@ class AutoScout24Scraper(BaseScraper):
         if script is None:
             return None
 
-        raw = script.string or script.get_text()
+        raw = (
+            script.string
+            or script.get_text()
+        )
 
         if not raw.strip():
             return None
 
         try:
-            return json.loads(raw)
+            return json.loads(
+                raw
+            )
 
         except Exception:
             return None
@@ -360,27 +492,32 @@ class AutoScout24Scraper(BaseScraper):
         self,
         data: Any,
     ) -> list[dict[str, Any]]:
-        """
-        Cerca ricorsivamente oggetti che sembrano rappresentare
-        annunci AutoScout24.
-
-        Non assumiamo una struttura rigida di __NEXT_DATA__ perché può
-        cambiare nel tempo.
-        """
 
         found: list[dict[str, Any]] = []
 
-        def walk(value: Any):
+        def walk(
+            value: Any,
+        ):
 
-            if isinstance(value, dict):
+            if isinstance(
+                value,
+                dict,
+            ):
 
-                if self._looks_like_listing(value):
-                    found.append(value)
+                if self._looks_like_listing(
+                    value
+                ):
+                    found.append(
+                        value
+                    )
 
                 for child in value.values():
                     walk(child)
 
-            elif isinstance(value, list):
+            elif isinstance(
+                value,
+                list,
+            ):
 
                 for child in value:
                     walk(child)
@@ -399,11 +536,14 @@ class AutoScout24Scraper(BaseScraper):
             for k in obj.keys()
         }
 
-        has_url = (
-            "url" in keys_lower
-            or "detailurl" in keys_lower
-            or "href" in keys_lower
-            or "deeplink" in keys_lower
+        has_url = any(
+            key in keys_lower
+            for key in {
+                "url",
+                "detailurl",
+                "href",
+                "deeplink",
+            }
         )
 
         has_price = any(
@@ -437,7 +577,7 @@ class AutoScout24Scraper(BaseScraper):
         )
 
     # ------------------------------------------------------------------
-    # Conversione dati strutturati
+    # Dati strutturati
     # ------------------------------------------------------------------
 
     def _from_structured_object(
@@ -457,13 +597,18 @@ class AutoScout24Scraper(BaseScraper):
             ],
         )
 
-        if isinstance(url, dict):
+        if isinstance(
+            url,
+            dict,
+        ):
+
             url = (
                 url.get("href")
                 or url.get("url")
             )
 
         if url:
+
             url = urljoin(
                 source_url,
                 str(url),
@@ -531,8 +676,11 @@ class AutoScout24Scraper(BaseScraper):
         return self._normalise(
             {
                 "url": url,
-                "title": title or "Volkswagen ID.3",
-                "description": description or "",
+                "title": title
+                or "Volkswagen ID.3",
+                "description": (
+                    description or ""
+                ),
                 "seller": seller,
                 "price_raw": price,
                 "mileage_raw": mileage,
@@ -546,9 +694,6 @@ class AutoScout24Scraper(BaseScraper):
         obj: dict[str, Any],
         names: list[str],
     ):
-        """
-        Cerca una chiave senza assumere il casing esatto.
-        """
 
         normalized = {
             str(k).lower(): v
@@ -578,7 +723,11 @@ class AutoScout24Scraper(BaseScraper):
             or obj.get("dealerName")
         )
 
-        if isinstance(seller, dict):
+        if isinstance(
+            seller,
+            dict,
+        ):
+
             return (
                 seller.get("name")
                 or seller.get("legalName")
@@ -596,9 +745,16 @@ class AutoScout24Scraper(BaseScraper):
         source_url: str,
     ) -> dict:
 
-        offers = obj.get("offers") or {}
+        offers = (
+            obj.get("offers")
+            or {}
+        )
 
-        if isinstance(offers, list):
+        if isinstance(
+            offers,
+            list,
+        ):
+
             offers = (
                 offers[0]
                 if offers
@@ -620,13 +776,19 @@ class AutoScout24Scraper(BaseScraper):
             or "Volkswagen ID.3"
         )
 
-        seller = self._extract_jsonld_seller(
-            obj
+        seller = (
+            self._extract_jsonld_seller(
+                obj
+            )
         )
 
         price = None
 
-        if isinstance(offers, dict):
+        if isinstance(
+            offers,
+            dict,
+        ):
+
             price = (
                 offers.get("price")
                 or offers.get(
@@ -641,11 +803,15 @@ class AutoScout24Scraper(BaseScraper):
                 "description": description,
                 "seller": seller,
                 "price_raw": price,
-                "mileage_raw": self._jsonld_mileage(
-                    obj
+                "mileage_raw": (
+                    self._jsonld_mileage(
+                        obj
+                    )
                 ),
-                "year_raw": self._jsonld_year(
-                    obj
+                "year_raw": (
+                    self._jsonld_year(
+                        obj
+                    )
                 ),
                 "raw": json.dumps(
                     obj,
@@ -659,9 +825,15 @@ class AutoScout24Scraper(BaseScraper):
         obj: dict,
     ):
 
-        seller = obj.get("seller")
+        seller = obj.get(
+            "seller"
+        )
 
-        if isinstance(seller, dict):
+        if isinstance(
+            seller,
+            dict,
+        ):
+
             return (
                 seller.get("name")
                 or seller.get("legalName")
@@ -678,8 +850,14 @@ class AutoScout24Scraper(BaseScraper):
             "mileageFromOdometer"
         )
 
-        if isinstance(mileage, dict):
-            return mileage.get("value")
+        if isinstance(
+            mileage,
+            dict,
+        ):
+
+            return mileage.get(
+                "value"
+            )
 
         return mileage
 
@@ -689,8 +867,12 @@ class AutoScout24Scraper(BaseScraper):
     ):
 
         return (
-            obj.get("vehicleModelDate")
-            or obj.get("productionDate")
+            obj.get(
+                "vehicleModelDate"
+            )
+            or obj.get(
+                "productionDate"
+            )
         )
 
     # ------------------------------------------------------------------
@@ -712,9 +894,6 @@ class AutoScout24Scraper(BaseScraper):
                 ),
                 "title": text[:200],
                 "description": text,
-                # IMPORTANT:
-                # Non cerchiamo più il prezzo genericamente nel testo.
-                # Questo evita falsi prezzi come 8264, 4791, ecc.
                 "price_raw": None,
                 "mileage_raw": None,
                 "year_raw": None,
@@ -737,45 +916,55 @@ class AutoScout24Scraper(BaseScraper):
             "",
         )
 
-        title = item.get(
-            "title",
-            "",
-        ) or ""
+        title = (
+            item.get(
+                "title",
+                "",
+            )
+            or ""
+        )
 
-        description = item.get(
-            "description",
-            "",
-        ) or ""
+        description = (
+            item.get(
+                "description",
+                "",
+            )
+            or ""
+        )
 
         seller = item.get(
             "seller"
         )
 
+        # Testo complessivo utilizzato SOLO per
+        # fallback di km/anno/batteria/potenza/infotainment.
         combined = (
             f"{title} "
             f"{description} "
             f"{raw}"
         )
 
-        # --------------------------------------------------------------
+        # ==============================================================
         # PREZZO
         #
-        # Priorità assoluta al dato strutturato.
-        #
-        # NON utilizziamo più un regex generico sul blocco completo,
-        # perché era la causa dei falsi prezzi.
-        # --------------------------------------------------------------
+        # Il prezzo continua ad essere preso esclusivamente dai
+        # dati strutturati.
+        # ==============================================================
 
         price = self._extract_price(
-            item.get("price_raw")
+            item.get(
+                "price_raw"
+            )
         )
 
-        # --------------------------------------------------------------
-        # KM
-        # --------------------------------------------------------------
+        # ==============================================================
+        # CHILOMETRAGGIO
+        # ==============================================================
 
-        mileage = self._number(
-            item.get("mileage_raw")
+        mileage = self._extract_mileage(
+            item.get(
+                "mileage_raw"
+            )
         )
 
         if mileage is None:
@@ -785,20 +974,22 @@ class AutoScout24Scraper(BaseScraper):
             )
 
             if match:
-                mileage = self._number(
-                    match.group(1)
+
+                mileage = (
+                    self._parse_thousands_number(
+                        match.group(1)
+                    )
                 )
 
-        # --------------------------------------------------------------
+        # ==============================================================
         # ANNO
-        # --------------------------------------------------------------
+        # ==============================================================
 
-        year = self._number(
-            item.get("year_raw")
+        year = self._extract_year(
+            item.get(
+                "year_raw"
+            )
         )
-
-        if year is not None:
-            year = int(year)
 
         if year is None:
 
@@ -815,71 +1006,48 @@ class AutoScout24Scraper(BaseScraper):
             if valid_years:
                 year = valid_years[0]
 
-        # --------------------------------------------------------------
+        # ==============================================================
         # BATTERIA
-        # --------------------------------------------------------------
+        # ==============================================================
 
-        battery = None
-
-        match = BATTERY_RE.search(
-            combined
-        )
-
-        if match:
-            battery = float(
-                match.group(1)
-            )
-
-        # --------------------------------------------------------------
-        # POTENZA
-        # --------------------------------------------------------------
-
-        power = None
-
-        match = POWER_RE.search(
-            combined
-        )
-
-        if match:
-
-            value = int(
-                match.group(1)
-            )
-
-            # Evitiamo di interpretare valori in kW come CV.
-            unit = match.group(0).lower()
-
-            if "kw" not in unit:
-                power = value
-
-        # --------------------------------------------------------------
-        # INFOTAINMENT 12.9"
-        # --------------------------------------------------------------
-
-        infotainment_match = (
-            INFOTAINMENT_RE.search(
+        battery = (
+            self._extract_battery(
                 combined
             )
         )
 
-        infotainment_candidate = (
-            infotainment_match is not None
+        # ==============================================================
+        # POTENZA
+        # ==============================================================
+
+        power = (
+            self._extract_power(
+                combined
+            )
         )
 
-        classification_evidence = ""
+        # ==============================================================
+        # INFOTAINMENT
+        # ==============================================================
 
-        if infotainment_match:
-            classification_evidence = (
-                "Possibile infotainment 12,9\": "
-                f"'{infotainment_match.group(1)}'"
-            )
+        (
+            infotainment_candidate,
+            infotainment_evidence,
+        ) = self._extract_infotainment(
+            combined
+        )
 
         return {
             "listing_id": self._listing_id(
-                item.get("url", "")
+                item.get(
+                    "url",
+                    "",
+                )
             ),
             "source": "autoscout24",
-            "url": item.get("url"),
+            "url": item.get(
+                "url"
+            ),
             "title": title,
             "price_eur": price,
             "mileage_km": mileage,
@@ -897,7 +1065,7 @@ class AutoScout24Scraper(BaseScraper):
                 infotainment_candidate
             ),
             "classification_evidence": (
-                classification_evidence
+                infotainment_evidence
             ),
         }
 
@@ -910,38 +1078,72 @@ class AutoScout24Scraper(BaseScraper):
         value,
     ):
         """
-        Converte SOLO un valore che proviene da un campo strutturato
-        di prezzo.
+        Converte esclusivamente un valore proveniente da un campo
+        strutturato di prezzo.
 
-        Non cerca il prezzo casualmente nell'intero HTML.
+        NON effettua una ricerca generica del prezzo nell'HTML.
         """
 
         if value is None:
             return None
 
-        # Caso numerico
         if isinstance(
             value,
             (int, float),
         ):
-            price = float(value)
 
-        # Caso stringa
+            price = float(
+                value
+            )
+
+        elif isinstance(
+            value,
+            dict,
+        ):
+
+            # Alcuni formati possono essere:
+            # {"value": 28300}
+            # {"amount": 28300}
+            # {"price": 28300}
+
+            nested = (
+                value.get("value")
+                or value.get("amount")
+                or value.get("price")
+            )
+
+            if nested is None:
+                return None
+
+            return AutoScout24Scraper._extract_price(
+                nested
+            )
+
         else:
 
-            text = str(value).strip()
+            text = str(
+                value
+            ).strip()
 
-            # Rimuove simbolo euro e spazi.
             text = (
                 text
-                .replace("€", "")
-                .replace("\u00a0", " ")
+                .replace(
+                    "€",
+                    "",
+                )
+                .replace(
+                    "\u00a0",
+                    " ",
+                )
                 .strip()
             )
 
-            # Formato italiano:
-            # 24.900
-            # 24.900,00
+            # Formati:
+            # 28.300
+            # 28.300,00
+            # 28300
+            # 28300,00
+
             match = re.search(
                 r"\d{1,3}(?:\.\d{3})+(?:,\d+)?"
                 r"|\d+(?:,\d+)?",
@@ -965,18 +1167,15 @@ class AutoScout24Scraper(BaseScraper):
             )
 
             try:
-                price = float(number)
+
+                price = float(
+                    number
+                )
 
             except ValueError:
                 return None
 
-        # --------------------------------------------------------------
-        # Controllo di plausibilità.
-        #
-        # Non vogliamo salvare come prezzo valori palesemente
-        # incompatibili con un'automobile.
-        # --------------------------------------------------------------
-
+        # Controllo plausibilità.
         if price < 1000:
             return None
 
@@ -986,11 +1185,335 @@ class AutoScout24Scraper(BaseScraper):
         return price
 
     # ------------------------------------------------------------------
-    # Conversione numerica
+    # Chilometraggio
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _number(value):
+    def _extract_mileage(
+        value,
+    ):
+
+        if value is None:
+            return None
+
+        if isinstance(
+            value,
+            dict,
+        ):
+
+            nested = (
+                value.get("value")
+                or value.get("amount")
+                or value.get("mileage")
+            )
+
+            if nested is None:
+                return None
+
+            return AutoScout24Scraper._extract_mileage(
+                nested
+            )
+
+        if isinstance(
+            value,
+            (int, float),
+        ):
+
+            return float(
+                value
+            )
+
+        text = str(
+            value
+        ).strip()
+
+        # Se il dato strutturato contiene "26173 km",
+        # prendiamo solo il numero.
+        match = re.search(
+            r"\d[\d\.\s,]*",
+            text,
+        )
+
+        if not match:
+            return None
+
+        return AutoScout24Scraper._parse_thousands_number(
+            match.group(0)
+        )
+
+    @staticmethod
+    def _parse_thousands_number(
+        value,
+    ):
+        """
+        Interpreta correttamente numeri italiani usati per il
+        chilometraggio.
+
+        Esempi:
+            26.173 -> 26173
+            40.698 -> 40698
+            7.910  -> 7910
+            7910   -> 7910
+        """
+
+        if value is None:
+            return None
+
+        text = str(
+            value
+        ).strip()
+
+        text = (
+            text.replace(
+                "\u00a0",
+                "",
+            )
+            .replace(
+                " ",
+                "",
+            )
+        )
+
+        # Nel contesto del chilometraggio, un punto fra gruppi
+        # di tre cifre è un separatore delle migliaia.
+        if re.fullmatch(
+            r"\d{1,3}(?:\.\d{3})+",
+            text,
+        ):
+
+            text = text.replace(
+                ".",
+                "",
+            )
+
+        # Stessa cosa per la virgola, nel caso di formato
+        # 26,173.
+        elif re.fullmatch(
+            r"\d{1,3}(?:,\d{3})+",
+            text,
+        ):
+
+            text = text.replace(
+                ",",
+                "",
+            )
+
+        else:
+
+            text = re.sub(
+                r"[^\d]",
+                "",
+                text,
+            )
+
+        if not text:
+            return None
+
+        try:
+            return float(
+                text
+            )
+
+        except ValueError:
+            return None
+
+    # ------------------------------------------------------------------
+    # Batteria
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_battery(
+        text: str,
+    ):
+
+        matches = BATTERY_RE.findall(
+            text
+        )
+
+        if not matches:
+            return None
+
+        values = [
+            float(x)
+            for x in matches
+        ]
+
+        # Preferiamo valori tipici delle batterie ID.3.
+        preferred = [
+            x
+            for x in values
+            if x in {
+                58,
+                59,
+                62,
+                77,
+                79,
+            }
+        ]
+
+        if preferred:
+            return preferred[0]
+
+        return values[0]
+
+    # ------------------------------------------------------------------
+    # Potenza
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_power(
+        text: str,
+    ):
+
+        matches = POWER_RE.findall(
+            text
+        )
+
+        if not matches:
+            return None
+
+        for number, unit in matches:
+
+            try:
+                value = float(
+                    number.replace(
+                        ",",
+                        ".",
+                    )
+                )
+
+            except ValueError:
+                continue
+
+            unit_lower = unit.lower()
+
+            if unit_lower == "cv":
+                return value
+
+            if unit_lower == "ps":
+                return value
+
+            if unit_lower == "kw":
+                # Conversione approssimata kW -> CV.
+                # 150 kW ≈ 204 CV.
+                return round(
+                    value * 1.35962
+                )
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Anno
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_year(
+        value,
+    ):
+
+        if value is None:
+            return None
+
+        if isinstance(
+            value,
+            dict,
+        ):
+
+            nested = (
+                value.get("year")
+                or value.get("value")
+                or value.get("date")
+            )
+
+            if nested is None:
+                return None
+
+            return AutoScout24Scraper._extract_year(
+                nested
+            )
+
+        text = str(
+            value
+        )
+
+        match = re.search(
+            r"\b(20\d{2})\b",
+            text,
+        )
+
+        if not match:
+            return None
+
+        year = int(
+            match.group(1)
+        )
+
+        if 2015 <= year <= 2035:
+            return year
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Infotainment
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_infotainment(
+        text: str,
+    ):
+
+        # Prima cerchiamo SEMPRE il 12,9".
+        match_129 = (
+            INFOTAINMENT_129_RE.search(
+                text
+            )
+        )
+
+        if match_129:
+
+            evidence = (
+                f"12,9\" trovato: "
+                f"'{match_129.group(0)}'"
+            )
+
+            return (
+                True,
+                evidence,
+            )
+
+        # Se non c'è 12,9", cerchiamo il 12".
+        match_12 = (
+            INFOTAINMENT_12_RE.search(
+                text
+            )
+        )
+
+        if match_12:
+
+            evidence = (
+                f"12\" trovato: "
+                f"'{match_12.group(0)}'"
+            )
+
+            return (
+                False,
+                evidence,
+            )
+
+        # Nessuna informazione sufficiente.
+        return (
+            None,
+            "",
+        )
+
+    # ------------------------------------------------------------------
+    # Conversione numerica generica
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _number(
+        value,
+    ):
 
         if value is None:
             return None
@@ -999,14 +1522,14 @@ class AutoScout24Scraper(BaseScraper):
             value,
             (int, float),
         ):
-            return float(value)
+            return float(
+                value
+            )
 
-        # Gestione di dizionari come:
-        # {"value": 24900}
-        # {"amount": 24900}
-        # {"price": 24900}
-
-        if isinstance(value, dict):
+        if isinstance(
+            value,
+            dict,
+        ):
 
             for key in (
                 "value",
@@ -1015,24 +1538,23 @@ class AutoScout24Scraper(BaseScraper):
             ):
 
                 if key in value:
-                    return AutoScout24Scraper._number(
-                        value[key]
+
+                    return (
+                        AutoScout24Scraper._number(
+                            value[key]
+                        )
                     )
 
             return None
 
-        s = str(value).strip()
-
-        # Migliaia italiane:
-        # 15.189 -> 15189
-        #
-        # Decimali:
-        # 15189,5 -> 15189.5
+        s = str(
+            value
+        ).strip()
 
         s = (
             s.replace(
                 "\u00a0",
-                " ",
+                "",
             )
             .replace(
                 " ",
@@ -1044,24 +1566,26 @@ class AutoScout24Scraper(BaseScraper):
             "." in s
             and "," in s
         ):
+
             s = s.replace(
                 ".",
                 "",
             )
+
             s = s.replace(
                 ",",
                 ".",
             )
 
         elif "," in s:
+
             s = s.replace(
                 ",",
                 ".",
             )
 
-        # Se ci sono più punti, probabilmente sono separatori
-        # delle migliaia.
         elif s.count(".") > 1:
+
             s = s.replace(
                 ".",
                 "",
@@ -1076,6 +1600,7 @@ class AutoScout24Scraper(BaseScraper):
             return None
 
         try:
+
             return float(
                 match.group()
             )
@@ -1093,7 +1618,9 @@ class AutoScout24Scraper(BaseScraper):
     ) -> str:
 
         return hashlib.sha256(
-            url.encode("utf-8")
+            url.encode(
+                "utf-8"
+            )
         ).hexdigest()[:16]
 
     # ------------------------------------------------------------------
@@ -1116,38 +1643,48 @@ class AutoScout24Scraper(BaseScraper):
             if not listing_id:
                 continue
 
-            # Se abbiamo trovato lo stesso annuncio più volte,
-            # preferiamo quello con più informazioni.
-            if listing_id not in unique:
-                unique[listing_id] = item
+            if (
+                listing_id
+                not in unique
+            ):
+
+                unique[
+                    listing_id
+                ] = item
+
                 continue
 
-            current = unique[listing_id]
+            current = unique[
+                listing_id
+            ]
 
-            current_score = (
-                sum(
-                    1
-                    for value in current.values()
-                    if value not in (
-                        None,
-                        "",
-                    )
+            current_score = sum(
+                1
+                for value
+                in current.values()
+                if value
+                not in (
+                    None,
+                    "",
                 )
             )
 
-            new_score = (
-                sum(
-                    1
-                    for value in item.values()
-                    if value not in (
-                        None,
-                        "",
-                    )
+            new_score = sum(
+                1
+                for value
+                in item.values()
+                if value
+                not in (
+                    None,
+                    "",
                 )
             )
 
             if new_score > current_score:
-                unique[listing_id] = item
+
+                unique[
+                    listing_id
+                ] = item
 
         return list(
             unique.values()

@@ -2356,25 +2356,25 @@ class AutoScout24Scraper:
 
         if not url:
             return False
-
+    
         try:
-            parsed = urlparse(
-                url
-            )
-
+            parsed = urlparse(url)
+    
             if (
                 parsed.netloc
                 and "autoscout24.it"
                 not in parsed.netloc
             ):
                 return False
-
+    
         except Exception:
             return False
-
+    
+        path = urlparse(url).path.lower()
+    
         return (
-            "/offerta/"
-            in url
+            "/annunci/" in path
+            or "/offerta/" in path
         )
 
     @staticmethod

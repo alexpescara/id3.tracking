@@ -1,4 +1,3 @@
-```python
 import hashlib
 import json
 import re
@@ -1153,4 +1152,3 @@ class AutoScout24Scraper(BaseScraper):
         return list(
             unique.values()
         )
-```

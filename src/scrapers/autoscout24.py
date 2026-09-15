@@ -1,3 +1,4 @@
+```python
 import hashlib
 import json
 import re
@@ -12,94 +13,105 @@ from playwright.sync_api import sync_playwright
 from .base import BaseScraper
 
 
-PRICE_RE = re.compile(
-    r"(?:€\s*)?(\d{1,3}(?:[.\s]\d{3})+|\d{4,6})(?:\s*€)?",
-    re.IGNORECASE,
-)
+# ---------------------------------------------------------------------------
+# Regex
+# ---------------------------------------------------------------------------
 
 KM_RE = re.compile(
-    r"(\d{1,3}(?:[.\s]\d{3})+|\d{4,7})\s*km",
+    r"(\d[\d\.\s]*)\s*km\b",
     re.IGNORECASE,
 )
 
-YEAR_RE = re.compile(r"\b(20\d{2})\b")
+YEAR_RE = re.compile(
+    r"\b(20\d{2})\b",
+)
 
 BATTERY_RE = re.compile(
-    r"\b(5[89]|6[0-9]|7[0-9]|8[0-9]|9[0-9]|1[0-2][0-9])\s*kWh\b",
+    r"\b(5[89]|6[0-9]|7[0-9]|8[0-9])\s*kWh\b",
     re.IGNORECASE,
 )
 
 POWER_RE = re.compile(
-    r"\b(\d{2,3})\s*(?:CV|PS|hp)\b",
+    r"\b(\d{2,3})\s*(?:CV|PS|kW)\b",
     re.IGNORECASE,
+)
+
+PRICE_RE = re.compile(
+    r"(?:€\s*)?(\d{1,3}(?:[.\s]\d{3})+|\d{4,6})(?:\s*€)?",
+)
+
+INFOTAINMENT_RE = re.compile(
+    r"""
+    (
+        12[\.,]?\s*9\s*(?:["”″]|pollici|inch)?
+        |
+        12[\.,]?\s*9
+        |
+        infotainment
+        |
+        discover\s+pro
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
 
 class AutoScout24Scraper(BaseScraper):
     """
-    Scraper pubblico AutoScout24 basato su Playwright.
+    Conservative public-page scraper for AutoScout24.
 
-    Non tenta di bypassare CAPTCHA, autenticazione o sistemi
-    anti-bot. Se AutoScout24 non restituisce normalmente i dati,
-    il contenuto viene semplicemente analizzato per quanto possibile.
+    The scraper:
+    - uses the public search page;
+    - extracts structured data when available;
+    - does not bypass CAPTCHA, login, robots restrictions or anti-bot
+      mechanisms;
+    - does not use paid APIs, proxies or external scraping services.
     """
 
     def search(self, search_url: str) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
 
-        scraper_cfg = self.config.get("scraper", {})
-
-        headless = scraper_cfg.get("headless", True)
-        timeout_ms = int(scraper_cfg.get("timeout_ms", 30000))
-        delay_seconds = float(scraper_cfg.get("delay_seconds", 2.5))
-        max_pages = int(scraper_cfg.get("max_pages", 3))
-        user_agent = scraper_cfg.get("user_agent")
-
-        print(f"AutoScout24: apertura {search_url}")
+        s_cfg = self.config["scraper"]
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless)
+            browser = p.chromium.launch(
+                headless=s_cfg.get("headless", True)
+            )
 
-            context_kwargs = {
-                "locale": "it-IT",
-                "viewport": {
-                    "width": 1440,
-                    "height": 1000,
-                },
-            }
-
-            if user_agent:
-                context_kwargs["user_agent"] = user_agent
-
-            context = browser.new_context(**context_kwargs)
+            context = browser.new_context(
+                user_agent=s_cfg.get("user_agent"),
+                locale="it-IT",
+                viewport={"width": 1440, "height": 1000},
+            )
 
             page = context.new_page()
-            page.set_default_timeout(timeout_ms)
+            page.set_default_timeout(
+                s_cfg.get("timeout_ms", 30000)
+            )
 
             try:
+                print(f"[AutoScout24] Apertura: {search_url}")
+
                 page.goto(
                     search_url,
                     wait_until="domcontentloaded",
-                    timeout=timeout_ms,
                 )
 
-                print(f"Pagina caricata: {page.url}")
-
-                # Lasciamo tempo al rendering JavaScript.
-                page.wait_for_timeout(4000)
+                page.wait_for_timeout(2500)
 
                 self._dismiss_common_consent(page)
 
-                # Un secondo piccolo intervallo dopo l'eventuale
-                # chiusura del banner cookie.
-                page.wait_for_timeout(1500)
+                max_pages = int(
+                    s_cfg.get("max_pages", 1)
+                )
 
-                for page_no in range(1, max_pages + 1):
-                    print(f"Analisi pagina {page_no}/{max_pages}")
+                for page_no in range(max_pages):
+                    print(
+                        f"[AutoScout24] Elaborazione pagina "
+                        f"{page_no + 1}/{max_pages}"
+                    )
 
                     html = page.content()
-
-                    print(f"HTML ricevuto: {len(html):,} caratteri")
 
                     page_results = self._parse_search_page(
                         html,
@@ -107,38 +119,46 @@ class AutoScout24Scraper(BaseScraper):
                     )
 
                     print(
-                        f"Annunci trovati nella pagina: "
+                        f"[AutoScout24] Annunci trovati nella pagina: "
                         f"{len(page_results)}"
                     )
 
                     results.extend(page_results)
 
-                    if page_no >= max_pages:
+                    if page_no + 1 >= max_pages:
                         break
 
-                    next_url = self._find_next_page(page)
+                    next_link = page.locator(
+                        'a[aria-label*="pagina successiva" i], '
+                        'a[aria-label*="next" i], '
+                        'a[title*="successiva" i]'
+                    )
 
-                    if not next_url:
-                        print("Nessuna pagina successiva trovata.")
+                    if next_link.count() == 0:
                         break
 
-                    print(f"Pagina successiva: {next_url}")
+                    href = next_link.first.get_attribute("href")
 
-                    time.sleep(delay_seconds)
+                    if not href:
+                        break
+
+                    next_url = urljoin(page.url, href)
+
+                    time.sleep(
+                        float(
+                            s_cfg.get(
+                                "delay_seconds",
+                                2.5,
+                            )
+                        )
+                    )
 
                     page.goto(
                         next_url,
                         wait_until="domcontentloaded",
-                        timeout=timeout_ms,
                     )
 
-                    page.wait_for_timeout(3500)
-
-            except Exception as exc:
-                print(
-                    "Errore durante lo scraping AutoScout24: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+                    page.wait_for_timeout(1800)
 
             finally:
                 context.close()
@@ -146,21 +166,21 @@ class AutoScout24Scraper(BaseScraper):
 
         results = self._deduplicate(results)
 
-        print(f"Totale annunci unici raccolti: {len(results)}")
+        print(
+            f"[AutoScout24] Totale annunci unici: {len(results)}"
+        )
 
         return results
 
+    # ------------------------------------------------------------------
+    # Cookie / consenso
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _dismiss_common_consent(page) -> None:
-        """
-        Prova a chiudere i principali banner cookie/consenso.
-        Non considera il fallimento un errore.
-        """
-
         selectors = [
             'button:has-text("Accetta tutto")',
             'button:has-text("Accetta")',
-            'button:has-text("Accetta tutti")',
             'button:has-text("Accept all")',
             'button:has-text("Accept")',
         ]
@@ -169,47 +189,17 @@ class AutoScout24Scraper(BaseScraper):
             try:
                 locator = page.locator(selector)
 
-                if locator.count() > 0:
-                    locator.first.click(timeout=2000)
-
-                    print("Banner consenso chiuso.")
-
-                    page.wait_for_timeout(700)
-
-                    return
+                if locator.count():
+                    locator.first.click(timeout=1500)
+                    page.wait_for_timeout(500)
+                    break
 
             except Exception:
                 pass
 
-    @staticmethod
-    def _find_next_page(page) -> str | None:
-        """
-        Cerca il collegamento alla pagina successiva.
-        """
-
-        selectors = [
-            'a[aria-label*="pagina successiva" i]',
-            'a[aria-label*="next" i]',
-            'a[title*="successiva" i]',
-            'a[rel="next"]',
-        ]
-
-        for selector in selectors:
-            try:
-                locator = page.locator(selector)
-
-                if locator.count() == 0:
-                    continue
-
-                href = locator.first.get_attribute("href")
-
-                if href:
-                    return urljoin(page.url, href)
-
-            except Exception:
-                pass
-
-        return None
+    # ------------------------------------------------------------------
+    # Parsing pagina
+    # ------------------------------------------------------------------
 
     def _parse_search_page(
         self,
@@ -219,378 +209,48 @@ class AutoScout24Scraper(BaseScraper):
 
         soup = BeautifulSoup(html, "lxml")
 
-        results: list[dict[str, Any]] = []
+        cards: list[dict[str, Any]] = []
 
-        # ---------------------------------------------------------
-        # 1. Metodo principale: __NEXT_DATA__
-        # ---------------------------------------------------------
+        # --------------------------------------------------------------
+        # 1. __NEXT_DATA__
+        #
+        # AutoScout24 utilizza dati strutturati lato client. Cerchiamo
+        # ricorsivamente gli oggetti che sembrano rappresentare annunci.
+        # --------------------------------------------------------------
 
         next_data = self._extract_next_data(soup)
 
-        if next_data:
-            print("__NEXT_DATA__ trovato.")
-
-            extracted = self._extract_from_next_data(
-                next_data,
-                source_url,
+        if next_data is not None:
+            next_candidates = self._find_listing_objects(
+                next_data
             )
 
-            print(
-                f"Annunci estratti da __NEXT_DATA__: "
-                f"{len(extracted)}"
-            )
+            for obj in next_candidates:
+                parsed = self._from_structured_object(
+                    obj,
+                    source_url,
+                )
 
-            results.extend(extracted)
+                if parsed.get("url"):
+                    cards.append(parsed)
 
-        # ---------------------------------------------------------
+        # --------------------------------------------------------------
         # 2. JSON-LD
-        # ---------------------------------------------------------
+        # --------------------------------------------------------------
 
-        jsonld_results = self._extract_jsonld(
-            soup,
-            source_url,
-        )
-
-        if jsonld_results:
-            print(
-                f"Annunci estratti da JSON-LD: "
-                f"{len(jsonld_results)}"
-            )
-
-            results.extend(jsonld_results)
-
-        # ---------------------------------------------------------
-        # 3. Fallback HTML
-        # ---------------------------------------------------------
-
-        if not results:
-            fallback_results = self._extract_from_links(
-                soup,
-                source_url,
-            )
-
-            print(
-                f"Annunci estratti dal fallback HTML: "
-                f"{len(fallback_results)}"
-            )
-
-            results.extend(fallback_results)
-
-        return [
-            item
-            for item in results
-            if item.get("url")
-        ]
-
-    @staticmethod
-    def _extract_next_data(
-        soup: BeautifulSoup,
-    ) -> dict[str, Any] | None:
-
-        script = soup.find(
-            "script",
-            id="__NEXT_DATA__",
-        )
-
-        if not script:
-            return None
-
-        try:
-            raw = script.string or script.get_text()
-
-            if not raw.strip():
-                return None
-
-            data = json.loads(raw)
-
-            if isinstance(data, dict):
-                return data
-
-        except Exception as exc:
-            print(
-                "Errore parsing __NEXT_DATA__: "
-                f"{type(exc).__name__}: {exc}"
-            )
-
-        return None
-
-    def _extract_from_next_data(
-        self,
-        data: dict[str, Any],
-        source_url: str,
-    ) -> list[dict[str, Any]]:
-
-        results: list[dict[str, Any]] = []
-
-        # AutoScout24 può cambiare leggermente la posizione
-        # dell'array degli annunci. Per questo cerchiamo
-        # ricorsivamente oggetti che abbiano caratteristiche
-        # tipiche di un annuncio.
-
-        candidates = self._find_listing_objects(data)
-
-        seen_urls: set[str] = set()
-
-        for obj in candidates:
-            item = self._listing_from_object(
-                obj,
-                source_url,
-            )
-
-            if not item:
-                continue
-
-            url = item.get("url")
-
-            if not url:
-                continue
-
-            if url in seen_urls:
-                continue
-
-            seen_urls.add(url)
-
-            results.append(item)
-
-        return results
-
-    def _find_listing_objects(
-        self,
-        value: Any,
-    ) -> list[dict[str, Any]]:
-
-        found: list[dict[str, Any]] = []
-
-        if isinstance(value, dict):
-
-            # Possibili indicatori di un oggetto listing.
-            keys_lower = {
-                str(k).lower()
-                for k in value.keys()
-            }
-
-            has_url = any(
-                key in keys_lower
-                for key in (
-                    "url",
-                    "listingurl",
-                    "detailurl",
-                )
-            )
-
-            has_vehicle_data = any(
-                key in keys_lower
-                for key in (
-                    "vehicle",
-                    "make",
-                    "model",
-                    "price",
-                    "mileage",
-                    "mileagekm",
-                    "firstregistration",
-                    "registration",
-                )
-            )
-
-            if has_url and has_vehicle_data:
-                found.append(value)
-
-            for child in value.values():
-                found.extend(
-                    self._find_listing_objects(child)
-                )
-
-        elif isinstance(value, list):
-
-            for child in value:
-                found.extend(
-                    self._find_listing_objects(child)
-                )
-
-        return found
-
-    def _listing_from_object(
-        self,
-        obj: dict[str, Any],
-        source_url: str,
-    ) -> dict[str, Any] | None:
-
-        url = self._get_first(
-            obj,
-            [
-                "url",
-                "listingUrl",
-                "listingURL",
-                "detailUrl",
-                "detailURL",
-            ],
-        )
-
-        if not url:
-            return None
-
-        url = urljoin(source_url, str(url))
-
-        # Evitiamo link non pertinenti.
-        if "autoscout24" not in url.lower():
-            return None
-
-        title = self._get_first(
-            obj,
-            [
-                "title",
-                "name",
-                "description",
-                "version",
-            ],
-        )
-
-        price = self._get_nested_or_first(
-            obj,
-            [
-                "price",
-                "priceValue",
-                "priceEur",
-                "offers.price",
-            ],
-        )
-
-        mileage = self._get_nested_or_first(
-            obj,
-            [
-                "mileage",
-                "mileageKm",
-                "mileageValue",
-                "vehicle.mileage",
-                "vehicle.mileageKm",
-            ],
-        )
-
-        year = self._get_nested_or_first(
-            obj,
-            [
-                "firstRegistration",
-                "firstRegistrationDate",
-                "registrationYear",
-                "year",
-                "vehicle.firstRegistration",
-            ],
-        )
-
-        power = self._get_nested_or_first(
-            obj,
-            [
-                "powerHp",
-                "power",
-                "vehicle.power",
-            ],
-        )
-
-        battery = self._get_nested_or_first(
-            obj,
-            [
-                "batteryKwh",
-                "batteryCapacity",
-                "batteryCapacityKwh",
-                "vehicle.batteryKwh",
-            ],
-        )
-
-        description = self._get_first(
-            obj,
-            [
-                "description",
-                "equipment",
-                "version",
-            ],
-        )
-
-        raw_text = json.dumps(
-            obj,
-            ensure_ascii=False,
-        )
-
-        return self._normalise(
-            {
-                "url": url,
-                "title": title or "Volkswagen ID.3",
-                "description": description or "",
-                "price_raw": price,
-                "mileage_raw": mileage,
-                "year_raw": year,
-                "power_raw": power,
-                "battery_raw": battery,
-                "raw": raw_text,
-            }
-        )
-
-    @staticmethod
-    def _get_first(
-        obj: dict[str, Any],
-        keys: list[str],
-    ) -> Any:
-
-        for key in keys:
-            if key in obj and obj[key] not in (
-                None,
-                "",
-                [],
-                {},
-            ):
-                return obj[key]
-
-        return None
-
-    @staticmethod
-    def _get_nested_or_first(
-        obj: dict[str, Any],
-        paths: list[str],
-    ) -> Any:
-
-        for path in paths:
-            current: Any = obj
-
-            try:
-                for part in path.split("."):
-                    if not isinstance(current, dict):
-                        current = None
-                        break
-
-                    current = current.get(part)
-
-                if current not in (
-                    None,
-                    "",
-                    [],
-                    {},
-                ):
-                    return current
-
-            except Exception:
-                continue
-
-        return None
-
-    def _extract_jsonld(
-        self,
-        soup: BeautifulSoup,
-        source_url: str,
-    ) -> list[dict[str, Any]]:
-
-        results: list[dict[str, Any]] = []
+        jsonld_cards = []
 
         for script in soup.find_all(
             "script",
             type="application/ld+json",
         ):
+            raw_script = script.string or script.get_text()
+
+            if not raw_script.strip():
+                continue
 
             try:
-                raw = script.string or script.get_text()
-
-                if not raw.strip():
-                    continue
-
-                data = json.loads(raw)
+                data = json.loads(raw_script)
 
             except Exception:
                 continue
@@ -610,12 +270,12 @@ class AutoScout24Scraper(BaseScraper):
 
                 if isinstance(obj_type, list):
                     valid_type = any(
-                        t in {
+                        x in {
                             "Car",
                             "Vehicle",
                             "Product",
                         }
-                        for t in obj_type
+                        for x in obj_type
                     )
                 else:
                     valid_type = obj_type in {
@@ -624,53 +284,396 @@ class AutoScout24Scraper(BaseScraper):
                         "Product",
                     }
 
-                if not valid_type:
+                if valid_type:
+                    parsed = self._from_jsonld(
+                        obj,
+                        source_url,
+                    )
+
+                    if parsed.get("url"):
+                        jsonld_cards.append(parsed)
+
+        # JSON-LD viene usato se non abbiamo già trovato gli stessi
+        # annunci tramite __NEXT_DATA__.
+        cards.extend(jsonld_cards)
+
+        # --------------------------------------------------------------
+        # 3. Fallback HTML
+        # --------------------------------------------------------------
+
+        if not cards:
+
+            for a in soup.find_all(
+                "a",
+                href=True,
+            ):
+                href = a.get("href", "")
+                text = " ".join(
+                    a.stripped_strings
+                )
+
+                if "/annunci/" not in href:
                     continue
 
-                offers = obj.get("offers") or {}
+                if "id.3" not in text.lower():
+                    continue
 
-                url = obj.get("url") or source_url
-
-                results.append(
-                    self._normalise(
-                        {
-                            "url": url,
-                            "title": obj.get(
-                                "name",
-                                "Volkswagen ID.3",
-                            ),
-                            "description": obj.get(
-                                "description",
-                                "",
-                            ),
-                            "price_raw": (
-                                offers.get("price")
-                                if isinstance(
-                                    offers,
-                                    dict,
-                                )
-                                else None
-                            ),
-                            "mileage_raw": (
-                                self._jsonld_mileage(obj)
-                            ),
-                            "year_raw": (
-                                self._jsonld_year(obj)
-                            ),
-                            "raw": json.dumps(
-                                obj,
-                                ensure_ascii=False,
-                            ),
-                        }
+                cards.append(
+                    self._from_text(
+                        text,
+                        href,
+                        source_url,
                     )
                 )
 
-        return results
+        return [
+            x
+            for x in cards
+            if x.get("url")
+        ]
+
+    # ------------------------------------------------------------------
+    # __NEXT_DATA__
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_next_data(soup: BeautifulSoup):
+        script = soup.find(
+            "script",
+            id="__NEXT_DATA__",
+        )
+
+        if script is None:
+            return None
+
+        raw = script.string or script.get_text()
+
+        if not raw.strip():
+            return None
+
+        try:
+            return json.loads(raw)
+
+        except Exception:
+            return None
+
+    def _find_listing_objects(
+        self,
+        data: Any,
+    ) -> list[dict[str, Any]]:
+        """
+        Cerca ricorsivamente oggetti che sembrano rappresentare
+        annunci AutoScout24.
+
+        Non assumiamo una struttura rigida di __NEXT_DATA__ perché può
+        cambiare nel tempo.
+        """
+
+        found: list[dict[str, Any]] = []
+
+        def walk(value: Any):
+
+            if isinstance(value, dict):
+
+                if self._looks_like_listing(value):
+                    found.append(value)
+
+                for child in value.values():
+                    walk(child)
+
+            elif isinstance(value, list):
+
+                for child in value:
+                    walk(child)
+
+        walk(data)
+
+        return found
+
+    @staticmethod
+    def _looks_like_listing(
+        obj: dict[str, Any],
+    ) -> bool:
+
+        keys_lower = {
+            str(k).lower()
+            for k in obj.keys()
+        }
+
+        has_url = (
+            "url" in keys_lower
+            or "detailurl" in keys_lower
+            or "href" in keys_lower
+            or "deeplink" in keys_lower
+        )
+
+        has_price = any(
+            key in keys_lower
+            for key in {
+                "price",
+                "pricevalue",
+                "priceamount",
+                "amount",
+            }
+        )
+
+        has_vehicle_data = any(
+            key in keys_lower
+            for key in {
+                "mileage",
+                "mileagefromodometer",
+                "make",
+                "model",
+                "vehicle",
+                "vehiclemodel",
+                "registration",
+                "firstregistration",
+            }
+        )
+
+        return (
+            has_url
+            and has_price
+            and has_vehicle_data
+        )
+
+    # ------------------------------------------------------------------
+    # Conversione dati strutturati
+    # ------------------------------------------------------------------
+
+    def _from_structured_object(
+        self,
+        obj: dict[str, Any],
+        source_url: str,
+    ) -> dict[str, Any]:
+
+        url = self._first_value(
+            obj,
+            [
+                "url",
+                "detailUrl",
+                "href",
+                "deepLink",
+                "deeplink",
+            ],
+        )
+
+        if isinstance(url, dict):
+            url = (
+                url.get("href")
+                or url.get("url")
+            )
+
+        if url:
+            url = urljoin(
+                source_url,
+                str(url),
+            )
+
+        title = self._first_value(
+            obj,
+            [
+                "name",
+                "title",
+                "displayName",
+                "vehicleName",
+            ],
+        )
+
+        price = self._first_value(
+            obj,
+            [
+                "price",
+                "priceValue",
+                "priceAmount",
+                "amount",
+            ],
+        )
+
+        mileage = self._first_value(
+            obj,
+            [
+                "mileage",
+                "mileageValue",
+                "mileageFromOdometer",
+                "odometer",
+            ],
+        )
+
+        year = self._first_value(
+            obj,
+            [
+                "registrationYear",
+                "firstRegistrationYear",
+                "firstRegistration",
+                "vehicleModelDate",
+                "productionDate",
+            ],
+        )
+
+        description = self._first_value(
+            obj,
+            [
+                "description",
+                "shortDescription",
+                "subtitle",
+            ],
+        )
+
+        seller = self._extract_seller(
+            obj
+        )
+
+        raw = json.dumps(
+            obj,
+            ensure_ascii=False,
+        )
+
+        return self._normalise(
+            {
+                "url": url,
+                "title": title or "Volkswagen ID.3",
+                "description": description or "",
+                "seller": seller,
+                "price_raw": price,
+                "mileage_raw": mileage,
+                "year_raw": year,
+                "raw": raw,
+            }
+        )
+
+    @staticmethod
+    def _first_value(
+        obj: dict[str, Any],
+        names: list[str],
+    ):
+        """
+        Cerca una chiave senza assumere il casing esatto.
+        """
+
+        normalized = {
+            str(k).lower(): v
+            for k, v in obj.items()
+        }
+
+        for name in names:
+
+            value = normalized.get(
+                name.lower()
+            )
+
+            if value is not None:
+                return value
+
+        return None
+
+    @staticmethod
+    def _extract_seller(
+        obj: dict[str, Any],
+    ):
+
+        seller = (
+            obj.get("seller")
+            or obj.get("dealer")
+            or obj.get("sellerName")
+            or obj.get("dealerName")
+        )
+
+        if isinstance(seller, dict):
+            return (
+                seller.get("name")
+                or seller.get("legalName")
+            )
+
+        return seller
+
+    # ------------------------------------------------------------------
+    # JSON-LD
+    # ------------------------------------------------------------------
+
+    def _from_jsonld(
+        self,
+        obj: dict,
+        source_url: str,
+    ) -> dict:
+
+        offers = obj.get("offers") or {}
+
+        if isinstance(offers, list):
+            offers = (
+                offers[0]
+                if offers
+                else {}
+            )
+
+        url = (
+            obj.get("url")
+            or source_url
+        )
+
+        description = (
+            obj.get("description")
+            or ""
+        )
+
+        title = (
+            obj.get("name")
+            or "Volkswagen ID.3"
+        )
+
+        seller = self._extract_jsonld_seller(
+            obj
+        )
+
+        price = None
+
+        if isinstance(offers, dict):
+            price = (
+                offers.get("price")
+                or offers.get(
+                    "lowPrice"
+                )
+            )
+
+        return self._normalise(
+            {
+                "url": url,
+                "title": title,
+                "description": description,
+                "seller": seller,
+                "price_raw": price,
+                "mileage_raw": self._jsonld_mileage(
+                    obj
+                ),
+                "year_raw": self._jsonld_year(
+                    obj
+                ),
+                "raw": json.dumps(
+                    obj,
+                    ensure_ascii=False,
+                ),
+            }
+        )
+
+    @staticmethod
+    def _extract_jsonld_seller(
+        obj: dict,
+    ):
+
+        seller = obj.get("seller")
+
+        if isinstance(seller, dict):
+            return (
+                seller.get("name")
+                or seller.get("legalName")
+            )
+
+        return seller
 
     @staticmethod
     def _jsonld_mileage(
-        obj: dict[str, Any],
-    ) -> Any:
+        obj: dict,
+    ):
 
         mileage = obj.get(
             "mileageFromOdometer"
@@ -683,92 +686,70 @@ class AutoScout24Scraper(BaseScraper):
 
     @staticmethod
     def _jsonld_year(
-        obj: dict[str, Any],
-    ) -> Any:
+        obj: dict,
+    ):
 
         return (
             obj.get("vehicleModelDate")
             or obj.get("productionDate")
-            or obj.get("dateVehicleFirstRegistered")
         )
 
-    def _extract_from_links(
+    # ------------------------------------------------------------------
+    # Fallback testo
+    # ------------------------------------------------------------------
+
+    def _from_text(
         self,
-        soup: BeautifulSoup,
+        text: str,
+        href: str,
         source_url: str,
-    ) -> list[dict[str, Any]]:
+    ) -> dict:
 
-        results: list[dict[str, Any]] = []
+        return self._normalise(
+            {
+                "url": urljoin(
+                    source_url,
+                    href,
+                ),
+                "title": text[:200],
+                "description": text,
+                # IMPORTANT:
+                # Non cerchiamo più il prezzo genericamente nel testo.
+                # Questo evita falsi prezzi come 8264, 4791, ecc.
+                "price_raw": None,
+                "mileage_raw": None,
+                "year_raw": None,
+                "seller": None,
+                "raw": text,
+            }
+        )
 
-        seen: set[str] = set()
-
-        for link in soup.find_all(
-            "a",
-            href=True,
-        ):
-
-            href = str(link.get("href", ""))
-
-            text = " ".join(
-                link.stripped_strings
-            )
-
-            combined = (
-                f"{text} {href}"
-            ).lower()
-
-            # Cerchiamo sia /annunci/ sia /offers/
-            # perché AutoScout24 può usare URL differenti.
-            if (
-                "/annunci/" not in combined
-                and "/offers/" not in combined
-            ):
-                continue
-
-            if "id.3" not in combined:
-                continue
-
-            url = urljoin(
-                source_url,
-                href,
-            )
-
-            if url in seen:
-                continue
-
-            seen.add(url)
-
-            results.append(
-                self._normalise(
-                    {
-                        "url": url,
-                        "title": text[:300],
-                        "description": text,
-                        "price_raw": None,
-                        "mileage_raw": None,
-                        "year_raw": None,
-                        "raw": text,
-                    }
-                )
-            )
-
-        return results
+    # ------------------------------------------------------------------
+    # Normalizzazione
+    # ------------------------------------------------------------------
 
     def _normalise(
         self,
-        item: dict[str, Any],
-    ) -> dict[str, Any]:
+        item: dict,
+    ) -> dict:
 
-        raw = str(
-            item.get("raw", "")
+        raw = item.get(
+            "raw",
+            "",
         )
 
-        title = str(
-            item.get("title", "")
-        )
+        title = item.get(
+            "title",
+            "",
+        ) or ""
 
-        description = str(
-            item.get("description", "")
+        description = item.get(
+            "description",
+            "",
+        ) or ""
+
+        seller = item.get(
+            "seller"
         )
 
         combined = (
@@ -777,65 +758,122 @@ class AutoScout24Scraper(BaseScraper):
             f"{raw}"
         )
 
-        price = self._number(
+        # --------------------------------------------------------------
+        # PREZZO
+        #
+        # Priorità assoluta al dato strutturato.
+        #
+        # NON utilizziamo più un regex generico sul blocco completo,
+        # perché era la causa dei falsi prezzi.
+        # --------------------------------------------------------------
+
+        price = self._extract_price(
             item.get("price_raw")
         )
+
+        # --------------------------------------------------------------
+        # KM
+        # --------------------------------------------------------------
 
         mileage = self._number(
             item.get("mileage_raw")
         )
 
-        year = self._extract_year(
+        if mileage is None:
+
+            match = KM_RE.search(
+                combined
+            )
+
+            if match:
+                mileage = self._number(
+                    match.group(1)
+                )
+
+        # --------------------------------------------------------------
+        # ANNO
+        # --------------------------------------------------------------
+
+        year = self._number(
             item.get("year_raw")
         )
 
-        power = self._number(
-            item.get("power_raw")
-        )
-
-        battery = self._number(
-            item.get("battery_raw")
-        )
-
-        if price is None:
-            price = self._extract_price(
-                combined
-            )
-
-        if mileage is None:
-            mileage = self._extract_mileage(
-                combined
-            )
+        if year is not None:
+            year = int(year)
 
         if year is None:
-            year_match = YEAR_RE.search(
+
+            matches = YEAR_RE.findall(
                 combined
             )
 
-            if year_match:
-                year = int(
-                    year_match.group(1)
-                )
+            valid_years = [
+                int(x)
+                for x in matches
+                if 2015 <= int(x) <= 2035
+            ]
 
-        if battery is None:
-            battery_match = BATTERY_RE.search(
-                combined
+            if valid_years:
+                year = valid_years[0]
+
+        # --------------------------------------------------------------
+        # BATTERIA
+        # --------------------------------------------------------------
+
+        battery = None
+
+        match = BATTERY_RE.search(
+            combined
+        )
+
+        if match:
+            battery = float(
+                match.group(1)
             )
 
-            if battery_match:
-                battery = float(
-                    battery_match.group(1)
-                )
+        # --------------------------------------------------------------
+        # POTENZA
+        # --------------------------------------------------------------
 
-        if power is None:
-            power_match = POWER_RE.search(
-                combined
+        power = None
+
+        match = POWER_RE.search(
+            combined
+        )
+
+        if match:
+
+            value = int(
+                match.group(1)
             )
 
-            if power_match:
-                power = int(
-                    power_match.group(1)
-                )
+            # Evitiamo di interpretare valori in kW come CV.
+            unit = match.group(0).lower()
+
+            if "kw" not in unit:
+                power = value
+
+        # --------------------------------------------------------------
+        # INFOTAINMENT 12.9"
+        # --------------------------------------------------------------
+
+        infotainment_match = (
+            INFOTAINMENT_RE.search(
+                combined
+            )
+        )
+
+        infotainment_candidate = (
+            infotainment_match is not None
+        )
+
+        classification_evidence = ""
+
+        if infotainment_match:
+            classification_evidence = (
+                "Possibile infotainment 12,9\": "
+                f"'{infotainment_match.group(1)}'"
+            )
 
         return {
             "listing_id": self._listing_id(
@@ -850,76 +888,112 @@ class AutoScout24Scraper(BaseScraper):
             "battery_kwh": battery,
             "power_hp": power,
             "description": description,
-            "seller": None,
+            "seller": seller,
             "collected_at": (
                 datetime.now(
                     timezone.utc
                 ).isoformat()
             ),
+            "infotainment_129_candidate": (
+                infotainment_candidate
+            ),
+            "classification_evidence": (
+                classification_evidence
+            ),
         }
+
+    # ------------------------------------------------------------------
+    # Prezzo
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _extract_price(
-        text: str,
-    ) -> float | None:
+        value,
+    ):
+        """
+        Converte SOLO un valore che proviene da un campo strutturato
+        di prezzo.
 
-        # Prima cerchiamo il simbolo euro.
-        match = PRICE_RE.search(text)
-
-        if not match:
-            return None
-
-        value = match.group(1)
-
-        return AutoScout24Scraper._number(
-            value
-        )
-
-    @staticmethod
-    def _extract_mileage(
-        text: str,
-    ) -> float | None:
-
-        match = KM_RE.search(text)
-
-        if not match:
-            return None
-
-        return AutoScout24Scraper._number(
-            match.group(1)
-        )
-
-    @staticmethod
-    def _extract_year(
-        value: Any,
-    ) -> int | None:
+        Non cerca il prezzo casualmente nell'intero HTML.
+        """
 
         if value is None:
             return None
 
-        match = YEAR_RE.search(
-            str(value)
-        )
-
-        if not match:
-            return None
-
-        return int(
-            match.group(1)
-        )
-
-    @staticmethod
-    def _number(
-        value: Any,
-    ) -> float | None:
-
-        if value is None:
-            return None
-
+        # Caso numerico
         if isinstance(
             value,
-            bool,
+            (int, float),
         ):
+            price = float(value)
+
+        # Caso stringa
+        else:
+
+            text = str(value).strip()
+
+            # Rimuove simbolo euro e spazi.
+            text = (
+                text
+                .replace("€", "")
+                .replace("\u00a0", " ")
+                .strip()
+            )
+
+            # Formato italiano:
+            # 24.900
+            # 24.900,00
+            match = re.search(
+                r"\d{1,3}(?:\.\d{3})+(?:,\d+)?"
+                r"|\d+(?:,\d+)?",
+                text,
+            )
+
+            if not match:
+                return None
+
+            number = match.group(0)
+
+            if "." in number:
+                number = number.replace(
+                    ".",
+                    "",
+                )
+
+            number = number.replace(
+                ",",
+                ".",
+            )
+
+            try:
+                price = float(number)
+
+            except ValueError:
+                return None
+
+        # --------------------------------------------------------------
+        # Controllo di plausibilità.
+        #
+        # Non vogliamo salvare come prezzo valori palesemente
+        # incompatibili con un'automobile.
+        # --------------------------------------------------------------
+
+        if price < 1000:
+            return None
+
+        if price > 200000:
+            return None
+
+        return price
+
+    # ------------------------------------------------------------------
+    # Conversione numerica
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _number(value):
+
+        if value is None:
             return None
 
         if isinstance(
@@ -928,70 +1002,91 @@ class AutoScout24Scraper(BaseScraper):
         ):
             return float(value)
 
-        text = str(value).strip()
+        # Gestione di dizionari come:
+        # {"value": 24900}
+        # {"amount": 24900}
+        # {"price": 24900}
 
-        if not text:
+        if isinstance(value, dict):
+
+            for key in (
+                "value",
+                "amount",
+                "price",
+            ):
+
+                if key in value:
+                    return AutoScout24Scraper._number(
+                        value[key]
+                    )
+
             return None
 
-        # Rimuove simboli e mantiene cifre,
-        # punto, virgola e segno.
-        text = re.sub(
-            r"[^\d,.\-]",
-            "",
-            text,
+        s = str(value).strip()
+
+        # Migliaia italiane:
+        # 15.189 -> 15189
+        #
+        # Decimali:
+        # 15189,5 -> 15189.5
+
+        s = (
+            s.replace(
+                "\u00a0",
+                " ",
+            )
+            .replace(
+                " ",
+                "",
+            )
         )
 
-        if not text:
-            return None
-
-        # Formato italiano:
-        # 23.900 -> 23900
-        # 23.900,50 -> 23900.50
-        if "," in text and "." in text:
-            text = text.replace(
+        if (
+            "." in s
+            and "," in s
+        ):
+            s = s.replace(
                 ".",
                 "",
-            ).replace(
+            )
+            s = s.replace(
                 ",",
                 ".",
             )
 
-        # 23,900 -> 23900 oppure 23,5 -> 23.5
-        elif "," in text:
-            parts = text.split(",")
+        elif "," in s:
+            s = s.replace(
+                ",",
+                ".",
+            )
 
-            if (
-                len(parts) == 2
-                and len(parts[1]) == 3
-            ):
-                text = (
-                    parts[0]
-                    + parts[1]
-                )
-            else:
-                text = text.replace(
-                    ",",
-                    ".",
-                )
+        # Se ci sono più punti, probabilmente sono separatori
+        # delle migliaia.
+        elif s.count(".") > 1:
+            s = s.replace(
+                ".",
+                "",
+            )
 
-        # 23.900 -> 23900
-        elif "." in text:
-            parts = text.split(".")
+        match = re.search(
+            r"\d+(?:\.\d+)?",
+            s,
+        )
 
-            if (
-                len(parts) == 2
-                and len(parts[1]) == 3
-            ):
-                text = (
-                    parts[0]
-                    + parts[1]
-                )
+        if not match:
+            return None
 
         try:
-            return float(text)
+            return float(
+                match.group()
+            )
 
         except ValueError:
             return None
+
+    # ------------------------------------------------------------------
+    # ID annuncio
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _listing_id(
@@ -1002,12 +1097,16 @@ class AutoScout24Scraper(BaseScraper):
             url.encode("utf-8")
         ).hexdigest()[:16]
 
+    # ------------------------------------------------------------------
+    # Deduplicazione
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _deduplicate(
-        items: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
+        items,
+    ):
 
-        unique: dict[str, dict[str, Any]] = {}
+        unique = {}
 
         for item in items:
 
@@ -1018,8 +1117,40 @@ class AutoScout24Scraper(BaseScraper):
             if not listing_id:
                 continue
 
-            unique[listing_id] = item
+            # Se abbiamo trovato lo stesso annuncio più volte,
+            # preferiamo quello con più informazioni.
+            if listing_id not in unique:
+                unique[listing_id] = item
+                continue
+
+            current = unique[listing_id]
+
+            current_score = (
+                sum(
+                    1
+                    for value in current.values()
+                    if value not in (
+                        None,
+                        "",
+                    )
+                )
+            )
+
+            new_score = (
+                sum(
+                    1
+                    for value in item.values()
+                    if value not in (
+                        None,
+                        "",
+                    )
+                )
+            )
+
+            if new_score > current_score:
+                unique[listing_id] = item
 
         return list(
             unique.values()
         )
+```

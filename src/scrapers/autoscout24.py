@@ -1460,109 +1460,91 @@ class AutoScout24Scraper:
         jsonld: list[Any],
         next_data: Any,
     ) -> str:
-
+    
+        # JSON-LD: accettiamo solo nomi che identificano realmente
+        # il veicolo. Evitiamo valori generici come "Volkswagen".
+        candidates = []
+    
         for obj in jsonld:
-
             if not isinstance(obj, dict):
                 continue
-
-            name = obj.get(
-                "name"
-            )
-
-            if isinstance(
-                name,
-                str,
-            ):
-
-                name = self._clean_text(
-                    name
-                )
-
-                if name:
-                    return name
-
-        h1 = soup.find(
-            "h1"
-        )
-
+    
+            name = obj.get("name")
+    
+            if not isinstance(name, str):
+                continue
+    
+            name = self._clean_text(name)
+    
+            if not name:
+                continue
+    
+            lower = name.lower()
+    
+            if "id.3" in lower or "id 3" in lower:
+                candidates.append(name)
+    
+        # Preferiamo il titolo più informativo.
+        if candidates:
+            return max(candidates, key=len)
+    
+        # H1 della pagina
+        h1 = soup.find("h1")
+    
         if h1:
-
             title = self._clean_text(
                 h1.get_text(
                     " ",
                     strip=True,
                 )
             )
-
-            if title:
+    
+            if (
+                "id.3" in title.lower()
+                or "id 3" in title.lower()
+            ):
                 return title
-
+    
+        # Cerca nei dati NEXT_DATA
+        for obj in self._walk_objects(next_data):
+            if not isinstance(obj, dict):
+                continue
+    
+            for key in [
+                "title",
+                "name",
+                "vehicleName",
+                "modelName",
+            ]:
+                value = obj.get(key)
+    
+                if not isinstance(value, str):
+                    continue
+    
+                value = self._clean_text(value)
+    
+                if (
+                    "id.3" in value.lower()
+                    or "id 3" in value.lower()
+                ):
+                    return value
+    
+        # Ultimo fallback: title HTML
         if soup.title:
-
             title = self._clean_text(
                 soup.title.get_text(
                     " ",
                     strip=True,
                 )
             )
-
-            if title:
+    
+            if (
+                "id.3" in title.lower()
+                or "id 3" in title.lower()
+            ):
                 return title
-
+    
         return "Volkswagen ID.3"
-
-    def _extract_card_title(
-        self,
-        container,
-    ) -> str:
-
-        # H2/H3 sono preferibili.
-        for tag in [
-            "h2",
-            "h3",
-            "h4",
-        ]:
-
-            element = container.find(
-                tag
-            )
-
-            if element:
-
-                text = self._clean_text(
-                    element.get_text(
-                        " ",
-                        strip=True,
-                    )
-                )
-
-                if (
-                    "id.3" in text.lower()
-                    or "id 3" in text.lower()
-                ):
-                    return text
-
-        # Fallback: cerca nel testo una frase contenente ID.3.
-        text = self._clean_text(
-            container.get_text(
-                " ",
-                strip=True,
-            )
-        )
-
-        match = re.search(
-            r'(Volkswagen\s+ID\.?3.*?)(?=\s+€|\s+\d{1,3}(?:\.\d{3})?\s*km|\s+\d{2}/20\d{2}|$)',
-            text,
-            flags=re.IGNORECASE,
-        )
-
-        if match:
-            return self._clean_text(
-                match.group(1)
-            )
-
-        return ""
 
     # ================================================================
     # GENERIC JSON HELPERS

@@ -899,7 +899,12 @@ class AutoScout24Scraper:
             listing["seller"] = detail["seller"]
     
         if detail.get("equipment"):
-            listing["equipment"] = detail["equipment"]
+            equipment = self._clean_text(
+                detail["equipment"]
+            )
+    
+            if len(equipment) <= 3000:
+                listing["equipment"] = equipment
     
         if (
             detail.get("infotainment_129_candidate")
@@ -1073,42 +1078,67 @@ class AutoScout24Scraper:
             "compra auto usate",
             "compra auto nuove",
             "ricerca concessionari",
+            "inserisci un annuncio",
+            "vendila a un rivenditore",
         ]
     
         def is_valid(value: str) -> bool:
-            value = self._clean_text(value)
+            value = self._clean_text(
+                value
+            )
     
             if len(value) < 30:
                 return False
     
-            lower = value.lower()
-    
-            # Evita il testo globale della pagina.
-            if sum(
-                fragment in lower
-                for fragment in generic_fragments
-            ) >= 2:
+            if len(value) > 3000:
                 return False
     
-            if len(value) > 5000:
+            lower = value.lower()
+    
+            # Evita testo globale della pagina
+            generic_count = sum(
+                fragment in lower
+                for fragment in generic_fragments
+            )
+    
+            if generic_count >= 2:
                 return False
     
             return True
     
+        # ------------------------------------------------------------
         # JSON-LD
+        # ------------------------------------------------------------
+    
         for obj in jsonld:
-            if not isinstance(obj, dict):
+    
+            if not isinstance(
+                obj,
+                dict,
+            ):
                 continue
     
-            value = obj.get("description")
+            value = obj.get(
+                "description"
+            )
     
-            if isinstance(value, str):
-                value = self._clean_text(value)
+            if not isinstance(
+                value,
+                str,
+            ):
+                continue
     
-                if is_valid(value):
-                    return value
+            value = self._clean_text(
+                value
+            )
     
+            if is_valid(value):
+                return value
+    
+        # ------------------------------------------------------------
         # Selettori specifici
+        # ------------------------------------------------------------
+    
         selectors = [
             '[data-testid="description"]',
             '[data-testid*="description"]',
@@ -1119,8 +1149,13 @@ class AutoScout24Scraper:
         candidates = []
     
         for selector in selectors:
+    
             try:
-                for element in soup.select(selector):
+    
+                for element in soup.select(
+                    selector
+                ):
+    
                     value = self._clean_text(
                         element.get_text(
                             " ",
@@ -1129,20 +1164,24 @@ class AutoScout24Scraper:
                     )
     
                     if is_valid(value):
-                        candidates.append(value)
+                        candidates.append(
+                            value
+                        )
     
             except Exception:
                 continue
     
-        if candidates:
-            # Preferiamo il testo più plausibile,
-            # non necessariamente quello più lungo.
-            return min(
-                candidates,
-                key=len,
-            )
+        if not candidates:
+            return ""
     
-        return ""
+        # Preferiamo descrizioni brevi e
+        # plausibili rispetto a contenitori enormi.
+        candidates = sorted(
+            set(candidates),
+            key=len,
+        )
+    
+        return candidates[0]
 
     def _extract_seller(
         self,
@@ -1280,49 +1319,62 @@ class AutoScout24Scraper:
         soup: BeautifulSoup,
         text: str,
     ) -> str:
-
+    
         pieces = []
-
+    
+        # ------------------------------------------------------------
+        # Selettori specifici
+        # ------------------------------------------------------------
+    
         selectors = [
-            '[data-testid*="equipment" i]',
-            '[class*="equipment" i]',
-            '[data-testid*="equip" i]',
-            '[class*="equip" i]',
+            '[data-testid="equipment"]',
+            '[data-testid="vehicle-equipment"]',
+            '[data-testid*="equipment-list" i]',
+            '[aria-label*="Equipaggiamento" i]',
+            '[aria-label*="Optional" i]',
         ]
-
+    
         for selector in selectors:
-
+    
             try:
-
+    
                 for element in soup.select(
                     selector
                 ):
-
+    
                     value = self._clean_text(
                         element.get_text(
                             " ",
                             strip=True,
                         )
                     )
-
+    
                     if (
-                        value
-                        and value not in pieces
+                        not value
+                        or len(value) < 3
+                        or len(value) > 2500
                     ):
+                        continue
+    
+                    if value not in pieces:
                         pieces.append(
                             value
                         )
-
+    
             except Exception:
                 continue
-
+    
         if pieces:
             return " | ".join(
                 pieces
             )
-
-        # Fallback mirato soprattutto alla ricerca
-        # del display/Ready2Discover.
+    
+        # ------------------------------------------------------------
+        # Fallback:
+        # estraiamo solo righe plausibilmente
+        # relative all'equipaggiamento.
+        # ------------------------------------------------------------
+    
         keywords = [
             "ready 2 discover",
             "ready2discover",
@@ -1332,28 +1384,47 @@ class AutoScout24Scraper:
             "touch screen",
             "display",
             "schermo",
-            "radio",
+            "assistance pack",
+            "comfort pack",
+            "tech pack",
+            "exterior pack",
+            "interior pack",
+            "park assist",
+            "pompa di calore",
+            "cerchi in lega",
+            "head-up display",
+            "matrix led",
+            "travel assist",
+            "lane assist",
+            "adaptive cruise",
         ]
-
+    
         lines = []
-
-        for line in text.splitlines():
-
+    
+        for raw_line in text.splitlines():
+    
             line = self._clean_text(
-                line
+                raw_line
             )
-
+    
+            if not line:
+                continue
+    
+            if len(line) > 500:
+                continue
+    
             lower = line.lower()
-
+    
             if any(
                 keyword in lower
                 for keyword in keywords
             ):
+    
                 if line not in lines:
                     lines.append(
                         line
                     )
-
+    
         return " | ".join(
             lines
         )
@@ -1375,7 +1446,6 @@ class AutoScout24Scraper:
                 title or "",
                 description or "",
                 equipment or "",
-                visible_text or "",
             ]
         )
 

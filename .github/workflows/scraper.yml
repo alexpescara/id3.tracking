@@ -39,6 +39,7 @@ jobs:
             timeout_ms: 30000
             delay_seconds: 2.5
             max_pages: 5
+            max_detail_pages: 30
             user_agent: "ID3-Market-Monitor/0.1 (open-source research project)"
 
           filters:

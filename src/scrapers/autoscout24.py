@@ -1,1691 +1,1696 @@
+from __future__ import annotations
+
 import hashlib
 import json
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
-from .base import BaseScraper
 
+class AutoScout24Scraper:
+    BASE_URL = "https://www.autoscout24.it"
 
-# ---------------------------------------------------------------------------
-# Regex
-# ---------------------------------------------------------------------------
+    def __init__(self, config: dict):
+        self.config = config
+        self.scraper_cfg = config.get("scraper", {})
 
-# Chilometraggio scritto normalmente in italiano:
-# 26.173 km
-# 40.698 km
-# 7.910 km
-#
-# Il punto viene trattato come separatore delle migliaia.
-KM_RE = re.compile(
-    r"\b(\d{1,3}(?:[.\s]\d{3})+|\d{4,6})\s*km\b",
-    re.IGNORECASE,
-)
+        self.headless = self.scraper_cfg.get("headless", True)
+        self.timeout_ms = int(self.scraper_cfg.get("timeout_ms", 30000))
+        self.delay_seconds = float(self.scraper_cfg.get("delay_seconds", 2.5))
+        self.max_pages = int(self.scraper_cfg.get("max_pages", 5))
 
-# Alcune pagine possono riportare anche "7910 km".
-KM_SIMPLE_RE = re.compile(
-    r"\b(\d{4,6})\s*km\b",
-    re.IGNORECASE,
-)
+        # Numero massimo di singole schede da aprire.
+        # Evita di fare troppe richieste in una singola esecuzione.
+        self.max_detail_pages = int(
+            self.scraper_cfg.get("max_detail_pages", 30)
+        )
 
-YEAR_RE = re.compile(
-    r"\b(20\d{2})\b"
-)
+        self.user_agent = self.scraper_cfg.get(
+            "user_agent",
+            "ID3-Market-Monitor/0.1 (open-source research project)",
+        )
 
-# Batterie tipiche ID.3.
-# Permettiamo anche valori non interi per essere più robusti.
-BATTERY_RE = re.compile(
-    r"\b("
-    r"5[0-9]|"
-    r"6[0-9]|"
-    r"7[0-9]|"
-    r"8[0-9]"
-    r")\s*kWh\b",
-    re.IGNORECASE,
-)
-
-# Potenza espressa in CV / PS / kW.
-POWER_RE = re.compile(
-    r"\b(\d{2,3}(?:[.,]\d+)?)\s*(CV|PS|kW)\b",
-    re.IGNORECASE,
-)
-
-# Infotainment 12,9".
-INFOTAINMENT_129_RE = re.compile(
-    r"""
-    (?:
-        \b12[\.,]\s*9\s*(?:["”“″]|pollici|inch)?
-        |
-        \b12[\.,]9\b
-        |
-        \b12\s+9\s*(?:["”“″]|pollici|inch)
-    )
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-# Display da 12" / 12 pollici.
-INFOTAINMENT_12_RE = re.compile(
-    r"""
-    (?:
-        \b12\s*(?:["”“″]|pollici|inch)
-        |
-        \bdisplay\s+(?:touchscreen\s+)?da\s+12
-        |
-        \bschermo\s+(?:touchscreen\s+)?da\s+12
-    )
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-
-class AutoScout24Scraper(BaseScraper):
-    """
-    Scraper conservativo per le pagine pubbliche di AutoScout24.
-
-    Priorità:
-    1. dati strutturati (__NEXT_DATA__);
-    2. JSON-LD;
-    3. testo della pagina come fallback.
-
-    Il prezzo NON viene mai estratto genericamente dall'intero testo:
-    viene utilizzato soltanto un campo strutturato quando disponibile.
-
-    Il scraper non tenta di aggirare CAPTCHA, login o sistemi anti-bot.
-    """
+    # ------------------------------------------------------------------
+    # PUBLIC API
+    # ------------------------------------------------------------------
 
     def search(self, search_url: str) -> list[dict[str, Any]]:
-        results: list[dict[str, Any]] = []
-
-        scraper_cfg = self.config["scraper"]
+        """
+        1. Apre le pagine dei risultati AutoScout24.
+        2. Raccoglie gli URL delle singole inserzioni.
+        3. Apre le singole inserzioni.
+        4. Estrae i dati tecnici/equipaggiamento.
+        """
 
         with sync_playwright() as p:
-
-            browser = p.chromium.launch(
-                headless=scraper_cfg.get(
-                    "headless",
-                    True,
-                )
-            )
+            browser = p.chromium.launch(headless=self.headless)
 
             context = browser.new_context(
-                user_agent=scraper_cfg.get(
-                    "user_agent"
-                ),
+                user_agent=self.user_agent,
                 locale="it-IT",
-                viewport={
-                    "width": 1440,
-                    "height": 1000,
-                },
+                timezone_id="Europe/Rome",
+                viewport={"width": 1440, "height": 1000},
             )
 
             page = context.new_page()
-
-            page.set_default_timeout(
-                scraper_cfg.get(
-                    "timeout_ms",
-                    30000,
-                )
-            )
+            page.set_default_timeout(self.timeout_ms)
 
             try:
+                listing_urls = self._collect_listing_urls(
+                    page,
+                    search_url,
+                )
 
                 print(
-                    f"[AutoScout24] Apertura: {search_url}"
+                    f"URL annunci individuati: {len(listing_urls)}"
                 )
 
-                page.goto(
-                    search_url,
-                    wait_until="domcontentloaded",
-                )
+                if not listing_urls:
+                    return []
 
-                page.wait_for_timeout(2500)
+                results: list[dict[str, Any]] = []
 
-                self._dismiss_common_consent(page)
-
-                max_pages = int(
-                    scraper_cfg.get(
-                        "max_pages",
-                        1,
-                    )
-                )
-
-                for page_no in range(max_pages):
-
+                for index, url in enumerate(
+                    listing_urls[: self.max_detail_pages],
+                    start=1,
+                ):
                     print(
-                        f"[AutoScout24] Elaborazione pagina "
-                        f"{page_no + 1}/{max_pages}"
+                        f"[{index}/{min(len(listing_urls), self.max_detail_pages)}] "
+                        f"Apro dettaglio: {url}"
                     )
 
-                    html = page.content()
-
-                    page_results = (
-                        self._parse_search_page(
-                            html,
-                            page.url,
+                    try:
+                        listing = self._scrape_detail_page(
+                            page,
+                            url,
                         )
-                    )
 
-                    print(
-                        f"[AutoScout24] Annunci trovati nella pagina: "
-                        f"{len(page_results)}"
-                    )
+                        if listing:
+                            results.append(listing)
 
-                    results.extend(
-                        page_results
-                    )
-
-                    if page_no + 1 >= max_pages:
-                        break
-
-                    next_link = page.locator(
-                        'a[aria-label*="pagina successiva" i], '
-                        'a[aria-label*="next" i], '
-                        'a[title*="successiva" i]'
-                    )
-
-                    if next_link.count() == 0:
-                        break
-
-                    href = (
-                        next_link.first.get_attribute(
-                            "href"
+                    except Exception as exc:
+                        print(
+                            f"ERRORE dettaglio {url}: "
+                            f"{type(exc).__name__}: {exc}"
                         )
-                    )
 
-                    if not href:
-                        break
+                    # Ritardo prudenziale tra le singole schede.
+                    if index < min(
+                        len(listing_urls),
+                        self.max_detail_pages,
+                    ):
+                        time.sleep(self.delay_seconds)
 
-                    next_url = urljoin(
-                        page.url,
-                        href,
-                    )
-
-                    time.sleep(
-                        float(
-                            scraper_cfg.get(
-                                "delay_seconds",
-                                2.5,
-                            )
-                        )
-                    )
-
-                    page.goto(
-                        next_url,
-                        wait_until="domcontentloaded",
-                    )
-
-                    page.wait_for_timeout(1800)
+                return results
 
             finally:
-
                 context.close()
                 browser.close()
 
-        results = self._deduplicate(
-            results
-        )
-
-        print(
-            f"[AutoScout24] Totale annunci unici: "
-            f"{len(results)}"
-        )
-
-        return results
-
     # ------------------------------------------------------------------
-    # Cookie / consenso
+    # SEARCH RESULTS
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _dismiss_common_consent(page) -> None:
+    def _collect_listing_urls(
+        self,
+        page,
+        search_url: str,
+    ) -> list[str]:
+
+        urls: list[str] = []
+        seen: set[str] = set()
+
+        current_url = search_url
+
+        for page_number in range(1, self.max_pages + 1):
+            print(
+                f"Pagina risultati AutoScout24 "
+                f"{page_number}/{self.max_pages}"
+            )
+
+            try:
+                page.goto(
+                    current_url,
+                    wait_until="domcontentloaded",
+                    timeout=self.timeout_ms,
+                )
+            except Exception as exc:
+                print(
+                    f"Errore apertura pagina risultati: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                break
+
+            self._wait_for_results(page)
+
+            # Primo metodo: link HTML visibili.
+            page_urls = self._extract_listing_urls_from_html(
+                page
+            )
+
+            # Secondo metodo: JSON/Next.js incorporato nella pagina.
+            if not page_urls:
+                page_urls = self._extract_listing_urls_from_json(
+                    page
+                )
+
+            for url in page_urls:
+                normalized = self._normalize_listing_url(url)
+
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    urls.append(normalized)
+
+            print(
+                f"  Trovati {len(page_urls)} URL nella pagina"
+            )
+
+            next_url = self._find_next_page_url(page)
+
+            if not next_url:
+                break
+
+            if next_url in seen:
+                break
+
+            current_url = next_url
+
+            time.sleep(self.delay_seconds)
+
+        return urls
+
+    def _wait_for_results(self, page) -> None:
+        """
+        Attende che la pagina abbia effettivamente caricato
+        almeno parte degli annunci.
+        """
+
+        try:
+            page.wait_for_selector(
+                'a[href*="/offerta/"]',
+                timeout=10000,
+            )
+            return
+        except Exception:
+            pass
+
+        try:
+            page.wait_for_timeout(3000)
+        except Exception:
+            pass
+
+    def _extract_listing_urls_from_html(
+        self,
+        page,
+    ) -> list[str]:
+
+        urls: list[str] = []
+
+        try:
+            links = page.locator("a").evaluate_all(
+                """
+                els => els.map(a => ({
+                    href: a.href,
+                    text: (a.innerText || "").trim()
+                }))
+                """
+            )
+        except Exception:
+            return urls
+
+        for item in links:
+            href = item.get("href")
+
+            if not href:
+                continue
+
+            if self._looks_like_listing_url(href):
+                urls.append(href)
+
+        return urls
+
+    def _extract_listing_urls_from_json(
+        self,
+        page,
+    ) -> list[str]:
+
+        urls: list[str] = []
+
+        try:
+            html = page.content()
+        except Exception:
+            return urls
+
+        soup = BeautifulSoup(html, "lxml")
+
+        for script in soup.find_all("script"):
+            text = script.string or script.get_text()
+
+            if not text:
+                continue
+
+            # Cerca URL AutoScout24 contenenti /offerta/
+            matches = re.findall(
+                r'https?://www\.autoscout24\.it/offerta/[^"\'\\\s]+',
+                text,
+            )
+
+            for match in matches:
+                urls.append(match)
+
+        return urls
+
+    def _find_next_page_url(self, page) -> str | None:
+        """
+        Cerca il link alla pagina successiva.
+        """
 
         selectors = [
-            'button:has-text("Accetta tutto")',
-            'button:has-text("Accetta")',
-            'button:has-text("Accept all")',
-            'button:has-text("Accept")',
+            'a[aria-label*="successiva" i]',
+            'a[title*="successiva" i]',
+            'a[href*="page="]',
         ]
 
         for selector in selectors:
-
             try:
+                elements = page.locator(selector)
 
-                locator = page.locator(
-                    selector
-                )
+                count = elements.count()
 
-                if locator.count():
+                for i in range(count):
+                    href = elements.nth(i).get_attribute("href")
 
-                    locator.first.click(
-                        timeout=1500
-                    )
-
-                    page.wait_for_timeout(
-                        500
-                    )
-
-                    break
+                    if href and self._looks_like_search_page_url(
+                        href
+                    ):
+                        return urljoin(
+                            self.BASE_URL,
+                            href,
+                        )
 
             except Exception:
-                pass
+                continue
+
+        return None
 
     # ------------------------------------------------------------------
-    # Parsing pagina
+    # DETAIL PAGE
     # ------------------------------------------------------------------
 
-    def _parse_search_page(
+    def _scrape_detail_page(
         self,
-        html: str,
-        source_url: str,
-    ) -> list[dict[str, Any]]:
+        page,
+        url: str,
+    ) -> dict[str, Any] | None:
 
-        soup = BeautifulSoup(
-            html,
-            "lxml",
-        )
-
-        cards: list[dict[str, Any]] = []
-
-        # ==============================================================
-        # 1. __NEXT_DATA__
-        # ==============================================================
-
-        next_data = (
-            self._extract_next_data(
-                soup
+        try:
+            page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=self.timeout_ms,
             )
-        )
-
-        if next_data is not None:
-
-            candidates = (
-                self._find_listing_objects(
-                    next_data
-                )
-            )
-
+        except Exception as exc:
             print(
-                f"[AutoScout24] Oggetti strutturati trovati: "
-                f"{len(candidates)}"
+                f"  Impossibile aprire dettaglio: {exc}"
             )
+            return None
 
-            for obj in candidates:
+        # Alcuni dati vengono caricati dopo il DOM iniziale.
+        try:
+            page.wait_for_timeout(2500)
+        except Exception:
+            pass
 
-                parsed = (
-                    self._from_structured_object(
-                        obj,
-                        source_url,
-                    )
-                )
+        html = page.content()
+        soup = BeautifulSoup(html, "lxml")
 
-                if parsed.get("url"):
-                    cards.append(
-                        parsed
-                    )
+        jsonld_objects = self._extract_jsonld_objects(soup)
+        next_data = self._extract_next_data(soup)
 
-        # ==============================================================
-        # 2. JSON-LD
-        # ==============================================================
+        visible_text = self._get_visible_text(soup)
+
+        title = self._extract_title(
+            soup,
+            jsonld_objects,
+            next_data,
+        )
+
+        price = self._extract_price(
+            soup,
+            jsonld_objects,
+            next_data,
+            visible_text,
+        )
+
+        mileage = self._extract_mileage(
+            soup,
+            jsonld_objects,
+            next_data,
+            visible_text,
+        )
+
+        registration_year = self._extract_registration_year(
+            soup,
+            jsonld_objects,
+            next_data,
+            visible_text,
+        )
+
+        battery_kwh = self._extract_battery(
+            title,
+            visible_text,
+            jsonld_objects,
+            next_data,
+        )
+
+        power_hp = self._extract_power(
+            title,
+            visible_text,
+            jsonld_objects,
+            next_data,
+        )
+
+        description = self._extract_description(
+            soup,
+            jsonld_objects,
+            next_data,
+        )
+
+        seller = self._extract_seller(
+            soup,
+            jsonld_objects,
+            next_data,
+        )
+
+        equipment = self._extract_equipment(
+            soup,
+            visible_text,
+        )
+
+        infotainment_candidate, classification_evidence = (
+            self._detect_129_infotainment(
+                title=title,
+                description=description,
+                equipment=equipment,
+                visible_text=visible_text,
+            )
+        )
+
+        listing_id = self._make_listing_id(url)
+
+        return {
+            "listing_id": listing_id,
+            "source": "autoscout24",
+            "url": url,
+            "title": title,
+            "price_eur": price,
+            "mileage_km": mileage,
+            "registration_year": registration_year,
+            "battery_kwh": battery_kwh,
+            "power_hp": power_hp,
+            "description": description,
+            "seller": seller,
+            "equipment": equipment,
+            "collected_at": datetime.now().isoformat(
+                timespec="seconds"
+            ),
+            "infotainment_129_candidate": infotainment_candidate,
+            "classification_evidence": classification_evidence,
+        }
+
+    # ------------------------------------------------------------------
+    # JSON-LD / NEXT DATA
+    # ------------------------------------------------------------------
+
+    def _extract_jsonld_objects(
+        self,
+        soup: BeautifulSoup,
+    ) -> list[Any]:
+
+        objects: list[Any] = []
 
         for script in soup.find_all(
             "script",
-            type="application/ld+json",
+            attrs={"type": "application/ld+json"},
         ):
+            raw = script.string or script.get_text()
 
-            raw_script = (
-                script.string
-                or script.get_text()
-            )
-
-            if not raw_script.strip():
+            if not raw:
                 continue
 
+            raw = raw.strip()
+
             try:
-                data = json.loads(
-                    raw_script
-                )
+                parsed = json.loads(raw)
+
+                if isinstance(parsed, list):
+                    objects.extend(parsed)
+                else:
+                    objects.append(parsed)
 
             except Exception:
                 continue
 
-            candidates = (
-                data
-                if isinstance(data, list)
-                else [data]
-            )
+        return objects
 
-            for obj in candidates:
-
-                if not isinstance(
-                    obj,
-                    dict,
-                ):
-                    continue
-
-                obj_type = obj.get(
-                    "@type"
-                )
-
-                if isinstance(
-                    obj_type,
-                    list,
-                ):
-
-                    valid_type = any(
-                        x in {
-                            "Car",
-                            "Vehicle",
-                            "Product",
-                        }
-                        for x in obj_type
-                    )
-
-                else:
-
-                    valid_type = (
-                        obj_type
-                        in {
-                            "Car",
-                            "Vehicle",
-                            "Product",
-                        }
-                    )
-
-                if not valid_type:
-                    continue
-
-                parsed = (
-                    self._from_jsonld(
-                        obj,
-                        source_url,
-                    )
-                )
-
-                if parsed.get("url"):
-                    cards.append(
-                        parsed
-                    )
-
-        # ==============================================================
-        # 3. Fallback HTML
-        # ==============================================================
-
-        if not cards:
-
-            for a in soup.find_all(
-                "a",
-                href=True,
-            ):
-
-                href = a.get(
-                    "href",
-                    "",
-                )
-
-                text = " ".join(
-                    a.stripped_strings
-                )
-
-                if "/annunci/" not in href:
-                    continue
-
-                if (
-                    "id.3"
-                    not in text.lower()
-                ):
-                    continue
-
-                cards.append(
-                    self._from_text(
-                        text,
-                        href,
-                        source_url,
-                    )
-                )
-
-        return [
-            x
-            for x in cards
-            if x.get("url")
-        ]
-
-    # ------------------------------------------------------------------
-    # __NEXT_DATA__
-    # ------------------------------------------------------------------
-
-    @staticmethod
     def _extract_next_data(
+        self,
         soup: BeautifulSoup,
-    ):
+    ) -> Any | None:
 
         script = soup.find(
             "script",
             id="__NEXT_DATA__",
         )
 
-        if script is None:
+        if not script:
             return None
 
-        raw = (
-            script.string
-            or script.get_text()
-        )
+        raw = script.string or script.get_text()
 
-        if not raw.strip():
+        if not raw:
             return None
 
         try:
-            return json.loads(
-                raw
-            )
-
+            return json.loads(raw)
         except Exception:
             return None
 
-    def _find_listing_objects(
-        self,
-        data: Any,
-    ) -> list[dict[str, Any]]:
-
-        found: list[dict[str, Any]] = []
-
-        def walk(
-            value: Any,
-        ):
-
-            if isinstance(
-                value,
-                dict,
-            ):
-
-                if self._looks_like_listing(
-                    value
-                ):
-                    found.append(
-                        value
-                    )
-
-                for child in value.values():
-                    walk(child)
-
-            elif isinstance(
-                value,
-                list,
-            ):
-
-                for child in value:
-                    walk(child)
-
-        walk(data)
-
-        return found
-
-    @staticmethod
-    def _looks_like_listing(
-        obj: dict[str, Any],
-    ) -> bool:
-
-        keys_lower = {
-            str(k).lower()
-            for k in obj.keys()
-        }
-
-        has_url = any(
-            key in keys_lower
-            for key in {
-                "url",
-                "detailurl",
-                "href",
-                "deeplink",
-            }
-        )
-
-        has_price = any(
-            key in keys_lower
-            for key in {
-                "price",
-                "pricevalue",
-                "priceamount",
-                "amount",
-            }
-        )
-
-        has_vehicle_data = any(
-            key in keys_lower
-            for key in {
-                "mileage",
-                "mileagefromodometer",
-                "make",
-                "model",
-                "vehicle",
-                "vehiclemodel",
-                "registration",
-                "firstregistration",
-            }
-        )
-
-        return (
-            has_url
-            and has_price
-            and has_vehicle_data
-        )
-
     # ------------------------------------------------------------------
-    # Dati strutturati
+    # GENERIC DATA SEARCH
     # ------------------------------------------------------------------
 
-    def _from_structured_object(
+    def _walk_values(
         self,
-        obj: dict[str, Any],
-        source_url: str,
-    ) -> dict[str, Any]:
-
-        url = self._first_value(
-            obj,
-            [
-                "url",
-                "detailUrl",
-                "href",
-                "deepLink",
-                "deeplink",
-            ],
-        )
-
-        if isinstance(
-            url,
-            dict,
-        ):
-
-            url = (
-                url.get("href")
-                or url.get("url")
-            )
-
-        if url:
-
-            url = urljoin(
-                source_url,
-                str(url),
-            )
-
-        title = self._first_value(
-            obj,
-            [
-                "name",
-                "title",
-                "displayName",
-                "vehicleName",
-            ],
-        )
-
-        price = self._first_value(
-            obj,
-            [
-                "price",
-                "priceValue",
-                "priceAmount",
-                "amount",
-            ],
-        )
-
-        mileage = self._first_value(
-            obj,
-            [
-                "mileage",
-                "mileageValue",
-                "mileageFromOdometer",
-                "odometer",
-            ],
-        )
-
-        year = self._first_value(
-            obj,
-            [
-                "registrationYear",
-                "firstRegistrationYear",
-                "firstRegistration",
-                "vehicleModelDate",
-                "productionDate",
-            ],
-        )
-
-        description = self._first_value(
-            obj,
-            [
-                "description",
-                "shortDescription",
-                "subtitle",
-            ],
-        )
-
-        seller = self._extract_seller(
-            obj
-        )
-
-        raw = json.dumps(
-            obj,
-            ensure_ascii=False,
-        )
-
-        return self._normalise(
-            {
-                "url": url,
-                "title": title
-                or "Volkswagen ID.3",
-                "description": (
-                    description or ""
-                ),
-                "seller": seller,
-                "price_raw": price,
-                "mileage_raw": mileage,
-                "year_raw": year,
-                "raw": raw,
-            }
-        )
-
-    @staticmethod
-    def _first_value(
-        obj: dict[str, Any],
-        names: list[str],
+        obj: Any,
+        key_names: set[str] | None = None,
     ):
+        """
+        Attraversa ricorsivamente dizionari/liste.
+
+        Restituisce coppie:
+            key, value
+        """
+
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+
+                if key_names is None or key.lower() in key_names:
+                    yield key, value
+
+                yield from self._walk_values(
+                    value,
+                    key_names,
+                )
+
+        elif isinstance(obj, list):
+            for item in obj:
+                yield from self._walk_values(
+                    item,
+                    key_names,
+                )
+
+    def _find_values_by_keys(
+        self,
+        objects: list[Any],
+        keys: set[str],
+    ) -> list[Any]:
+
+        values: list[Any] = []
 
         normalized = {
-            str(k).lower(): v
-            for k, v in obj.items()
+            x.lower()
+            for x in keys
         }
 
-        for name in names:
+        for obj in objects:
+            for _, value in self._walk_values(
+                obj,
+                normalized,
+            ):
+                values.append(value)
 
-            value = normalized.get(
-                name.lower()
-            )
-
-            if value is not None:
-                return value
-
-        return None
-
-    @staticmethod
-    def _extract_seller(
-        obj: dict[str, Any],
-    ):
-
-        seller = (
-            obj.get("seller")
-            or obj.get("dealer")
-            or obj.get("sellerName")
-            or obj.get("dealerName")
-        )
-
-        if isinstance(
-            seller,
-            dict,
-        ):
-
-            return (
-                seller.get("name")
-                or seller.get("legalName")
-            )
-
-        return seller
+        return values
 
     # ------------------------------------------------------------------
-    # JSON-LD
+    # PRICE
     # ------------------------------------------------------------------
 
-    def _from_jsonld(
+    def _extract_price(
         self,
-        obj: dict,
-        source_url: str,
-    ) -> dict:
+        soup: BeautifulSoup,
+        jsonld_objects: list[Any],
+        next_data: Any,
+        visible_text: str,
+    ) -> float | None:
 
-        offers = (
-            obj.get("offers")
-            or {}
-        )
+        # 1. JSON-LD Offer.price
+        for obj in jsonld_objects:
 
-        if isinstance(
-            offers,
-            list,
-        ):
+            if not isinstance(obj, dict):
+                continue
 
-            offers = (
-                offers[0]
-                if offers
-                else {}
-            )
+            offers = obj.get("offers")
 
-        url = (
-            obj.get("url")
-            or source_url
-        )
-
-        description = (
-            obj.get("description")
-            or ""
-        )
-
-        title = (
-            obj.get("name")
-            or "Volkswagen ID.3"
-        )
-
-        seller = (
-            self._extract_jsonld_seller(
-                obj
-            )
-        )
-
-        price = None
-
-        if isinstance(
-            offers,
-            dict,
-        ):
-
-            price = (
-                offers.get("price")
-                or offers.get(
-                    "lowPrice"
+            if isinstance(offers, dict):
+                value = self._numeric_price(
+                    offers.get("price")
                 )
+
+                if value:
+                    return value
+
+            elif isinstance(offers, list):
+                for offer in offers:
+                    if isinstance(offer, dict):
+                        value = self._numeric_price(
+                            offer.get("price")
+                        )
+
+                        if value:
+                            return value
+
+        # 2. NEXT_DATA / dati strutturati
+        if next_data is not None:
+            candidates = self._find_values_by_keys(
+                [next_data],
+                {
+                    "price",
+                    "pricevalue",
+                    "listingprice",
+                    "vehicleprice",
+                },
             )
 
-        return self._normalise(
-            {
-                "url": url,
-                "title": title,
-                "description": description,
-                "seller": seller,
-                "price_raw": price,
-                "mileage_raw": (
-                    self._jsonld_mileage(
-                        obj
-                    )
-                ),
-                "year_raw": (
-                    self._jsonld_year(
-                        obj
-                    )
-                ),
-                "raw": json.dumps(
-                    obj,
-                    ensure_ascii=False,
-                ),
-            }
-        )
+            for candidate in candidates:
+                value = self._numeric_price(candidate)
 
-    @staticmethod
-    def _extract_jsonld_seller(
-        obj: dict,
-    ):
+                if value:
+                    # Evitiamo numeri palesemente non plausibili.
+                    if 3000 <= value <= 200000:
+                        return value
 
-        seller = obj.get(
-            "seller"
-        )
+        # 3. HTML, ma solo in contesti espliciti di prezzo.
+        patterns = [
+            r'€\s*([0-9][0-9\.\s]*)',
+            r'([0-9][0-9\.\s]*)\s*€',
+        ]
 
-        if isinstance(
-            seller,
-            dict,
-        ):
-
-            return (
-                seller.get("name")
-                or seller.get("legalName")
-            )
-
-        return seller
-
-    @staticmethod
-    def _jsonld_mileage(
-        obj: dict,
-    ):
-
-        mileage = obj.get(
-            "mileageFromOdometer"
-        )
-
-        if isinstance(
-            mileage,
-            dict,
-        ):
-
-            return mileage.get(
-                "value"
-            )
-
-        return mileage
-
-    @staticmethod
-    def _jsonld_year(
-        obj: dict,
-    ):
-
-        return (
-            obj.get(
-                "vehicleModelDate"
-            )
-            or obj.get(
-                "productionDate"
-            )
-        )
-
-    # ------------------------------------------------------------------
-    # Fallback testo
-    # ------------------------------------------------------------------
-
-    def _from_text(
-        self,
-        text: str,
-        href: str,
-        source_url: str,
-    ) -> dict:
-
-        return self._normalise(
-            {
-                "url": urljoin(
-                    source_url,
-                    href,
-                ),
-                "title": text[:200],
-                "description": text,
-                "price_raw": None,
-                "mileage_raw": None,
-                "year_raw": None,
-                "seller": None,
-                "raw": text,
-            }
-        )
-
-    # ------------------------------------------------------------------
-    # Normalizzazione
-    # ------------------------------------------------------------------
-
-    def _normalise(
-        self,
-        item: dict,
-    ) -> dict:
-
-        raw = item.get(
-            "raw",
-            "",
-        )
-
-        title = (
-            item.get(
-                "title",
-                "",
-            )
-            or ""
-        )
-
-        description = (
-            item.get(
-                "description",
-                "",
-            )
-            or ""
-        )
-
-        seller = item.get(
-            "seller"
-        )
-
-        # Testo complessivo utilizzato SOLO per
-        # fallback di km/anno/batteria/potenza/infotainment.
-        combined = (
-            f"{title} "
-            f"{description} "
-            f"{raw}"
-        )
-
-        # ==============================================================
-        # PREZZO
-        #
-        # Il prezzo continua ad essere preso esclusivamente dai
-        # dati strutturati.
-        # ==============================================================
-
-        price = self._extract_price(
-            item.get(
-                "price_raw"
-            )
-        )
-
-        # ==============================================================
-        # CHILOMETRAGGIO
-        # ==============================================================
-
-        mileage = self._extract_mileage(
-            item.get(
-                "mileage_raw"
-            )
-        )
-
-        if mileage is None:
-
-            match = KM_RE.search(
-                combined
+        for pattern in patterns:
+            match = re.search(
+                pattern,
+                visible_text,
+                flags=re.IGNORECASE,
             )
 
             if match:
-
-                mileage = (
-                    self._parse_thousands_number(
-                        match.group(1)
-                    )
+                value = self._parse_european_number(
+                    match.group(1)
                 )
 
-        # ==============================================================
-        # ANNO
-        # ==============================================================
+                if value and 3000 <= value <= 200000:
+                    return value
 
-        year = self._extract_year(
-            item.get(
-                "year_raw"
-            )
-        )
+        return None
 
-        if year is None:
-
-            matches = YEAR_RE.findall(
-                combined
-            )
-
-            valid_years = [
-                int(x)
-                for x in matches
-                if 2015 <= int(x) <= 2035
-            ]
-
-            if valid_years:
-                year = valid_years[0]
-
-        # ==============================================================
-        # BATTERIA
-        # ==============================================================
-
-        battery = (
-            self._extract_battery(
-                combined
-            )
-        )
-
-        # ==============================================================
-        # POTENZA
-        # ==============================================================
-
-        power = (
-            self._extract_power(
-                combined
-            )
-        )
-
-        # ==============================================================
-        # INFOTAINMENT
-        # ==============================================================
-
-        (
-            infotainment_candidate,
-            infotainment_evidence,
-        ) = self._extract_infotainment(
-            combined
-        )
-
-        return {
-            "listing_id": self._listing_id(
-                item.get(
-                    "url",
-                    "",
-                )
-            ),
-            "source": "autoscout24",
-            "url": item.get(
-                "url"
-            ),
-            "title": title,
-            "price_eur": price,
-            "mileage_km": mileage,
-            "registration_year": year,
-            "battery_kwh": battery,
-            "power_hp": power,
-            "description": description,
-            "seller": seller,
-            "collected_at": (
-                datetime.now(
-                    timezone.utc
-                ).isoformat()
-            ),
-            "infotainment_129_candidate": (
-                infotainment_candidate
-            ),
-            "classification_evidence": (
-                infotainment_evidence
-            ),
-        }
-
-    # ------------------------------------------------------------------
-    # Prezzo
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _extract_price(
-        value,
-    ):
-        """
-        Converte esclusivamente un valore proveniente da un campo
-        strutturato di prezzo.
-
-        NON effettua una ricerca generica del prezzo nell'HTML.
-        """
+    def _numeric_price(
+        self,
+        value: Any,
+    ) -> float | None:
 
         if value is None:
             return None
 
-        if isinstance(
-            value,
-            (int, float),
-        ):
+        if isinstance(value, (int, float)):
+            number = float(value)
 
-            price = float(
-                value
-            )
-
-        elif isinstance(
-            value,
-            dict,
-        ):
-
-            # Alcuni formati possono essere:
-            # {"value": 28300}
-            # {"amount": 28300}
-            # {"price": 28300}
-
-            nested = (
-                value.get("value")
-                or value.get("amount")
-                or value.get("price")
-            )
-
-            if nested is None:
+            if number <= 0:
                 return None
 
-            return AutoScout24Scraper._extract_price(
-                nested
-            )
+            return number
 
-        else:
+        if isinstance(value, str):
+            text = value.strip()
 
-            text = str(
-                value
-            ).strip()
-
-            text = (
-                text
-                .replace(
-                    "€",
-                    "",
-                )
-                .replace(
-                    "\u00a0",
-                    " ",
-                )
-                .strip()
-            )
-
-            # Formati:
-            # 28.300
-            # 28.300,00
-            # 28300
-            # 28300,00
+            # Evita di interpretare stringhe non monetarie.
+            if not re.search(r"\d", text):
+                return None
 
             match = re.search(
-                r"\d{1,3}(?:\.\d{3})+(?:,\d+)?"
-                r"|\d+(?:,\d+)?",
+                r"\d[\d\.\s,]*",
                 text,
             )
 
             if not match:
                 return None
 
-            number = match.group(0)
-
-            if "." in number:
-                number = number.replace(
-                    ".",
-                    "",
-                )
-
-            number = number.replace(
-                ",",
-                ".",
+            return self._parse_european_number(
+                match.group(0)
             )
 
-            try:
+        return None
 
-                price = float(
-                    number
+    # ------------------------------------------------------------------
+    # MILEAGE
+    # ------------------------------------------------------------------
+
+    def _extract_mileage(
+        self,
+        soup: BeautifulSoup,
+        jsonld_objects: list[Any],
+        next_data: Any,
+        visible_text: str,
+    ) -> int | None:
+
+        # JSON-LD
+        for obj in jsonld_objects:
+
+            if not isinstance(obj, dict):
+                continue
+
+            mileage = obj.get("mileageFromOdometer")
+
+            if isinstance(mileage, dict):
+                value = mileage.get("value")
+
+                parsed = self._parse_integer(value)
+
+                if parsed is not None:
+                    return parsed
+
+        # NEXT_DATA
+        if next_data is not None:
+            candidates = self._find_values_by_keys(
+                [next_data],
+                {
+                    "mileage",
+                    "mileagekm",
+                    "kilometers",
+                    "kilometres",
+                    "odometer",
+                },
+            )
+
+            for candidate in candidates:
+                parsed = self._parse_mileage(candidate)
+
+                if parsed is not None:
+                    return parsed
+
+        # Testo visibile.
+        patterns = [
+            r'(\d[\d\.\s]*)\s*km\b',
+            r'(\d[\d\.\s]*)\s*chilometri\b',
+        ]
+
+        for pattern in patterns:
+            match = re.search(
+                pattern,
+                visible_text,
+                flags=re.IGNORECASE,
+            )
+
+            if match:
+                parsed = self._parse_integer(
+                    match.group(1)
                 )
 
-            except ValueError:
-                return None
+                if parsed is not None:
+                    return parsed
 
-        # Controllo plausibilità.
-        if price < 1000:
-            return None
+        return None
 
-        if price > 200000:
-            return None
-
-        return price
-
-    # ------------------------------------------------------------------
-    # Chilometraggio
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _extract_mileage(
-        value,
-    ):
+    def _parse_mileage(
+        self,
+        value: Any,
+    ) -> int | None:
 
         if value is None:
             return None
 
-        if isinstance(
-            value,
-            dict,
-        ):
+        if isinstance(value, (int, float)):
+            number = int(value)
 
-            nested = (
-                value.get("value")
-                or value.get("amount")
-                or value.get("mileage")
+            if 0 <= number <= 1000000:
+                return number
+
+            return None
+
+        if isinstance(value, str):
+            match = re.search(
+                r'\d[\d\.\s]*',
+                value,
             )
 
-            if nested is None:
-                return None
+            if match:
+                return self._parse_integer(
+                    match.group(0)
+                )
 
-            return AutoScout24Scraper._extract_mileage(
-                nested
+        return None
+
+    # ------------------------------------------------------------------
+    # YEAR
+    # ------------------------------------------------------------------
+
+    def _extract_registration_year(
+        self,
+        soup: BeautifulSoup,
+        jsonld_objects: list[Any],
+        next_data: Any,
+        visible_text: str,
+    ) -> int | None:
+
+        # JSON-LD date
+        for obj in jsonld_objects:
+
+            if not isinstance(obj, dict):
+                continue
+
+            date_fields = [
+                obj.get("datePosted"),
+                obj.get("dateVehicleFirstRegistered"),
+                obj.get("vehicleConfiguration"),
+            ]
+
+            for value in date_fields:
+                year = self._extract_year_from_value(value)
+
+                if year:
+                    return year
+
+        # NEXT_DATA
+        if next_data is not None:
+            candidates = self._find_values_by_keys(
+                [next_data],
+                {
+                    "registrationdate",
+                    "firstregistration",
+                    "datefirstregistered",
+                    "registrationyear",
+                    "year",
+                },
             )
 
-        if isinstance(
-            value,
-            (int, float),
-        ):
+            for candidate in candidates:
+                year = self._extract_year_from_value(
+                    candidate
+                )
 
-            return float(
-                value
+                if year and 2000 <= year <= 2035:
+                    return year
+
+        # Testo.
+        patterns = [
+            r'\b(20[0-3]\d)\b',
+        ]
+
+        for pattern in patterns:
+            match = re.search(
+                pattern,
+                visible_text,
             )
 
-        text = str(
-            value
-        ).strip()
+            if match:
+                year = int(match.group(1))
 
-        # Se il dato strutturato contiene "26173 km",
-        # prendiamo solo il numero.
+                if 2000 <= year <= 2035:
+                    return year
+
+        return None
+
+    def _extract_year_from_value(
+        self,
+        value: Any,
+    ) -> int | None:
+
+        if value is None:
+            return None
+
+        text = str(value)
+
         match = re.search(
-            r"\d[\d\.\s,]*",
+            r'\b(20[0-3]\d)\b',
             text,
         )
 
         if not match:
             return None
 
-        return AutoScout24Scraper._parse_thousands_number(
-            match.group(0)
+        return int(match.group(1))
+
+    # ------------------------------------------------------------------
+    # BATTERY
+    # ------------------------------------------------------------------
+
+    def _extract_battery(
+        self,
+        title: str,
+        visible_text: str,
+        jsonld_objects: list[Any],
+        next_data: Any,
+    ) -> float | None:
+
+        # Prima il titolo: spesso contiene "58 kWh", "59 kWh",
+        # "77 kWh", ecc.
+        battery = self._parse_battery_from_text(title)
+
+        if battery is not None:
+            return battery
+
+        # Poi dati strutturati.
+        objects = list(jsonld_objects)
+
+        if next_data is not None:
+            objects.append(next_data)
+
+        candidates = self._find_values_by_keys(
+            objects,
+            {
+                "batterycapacity",
+                "batterycapacitykwh",
+                "battery_kwh",
+                "battery",
+                "capacity",
+            },
+        )
+
+        for candidate in candidates:
+            battery = self._parse_battery_value(candidate)
+
+            if battery is not None:
+                return battery
+
+        # Infine testo completo.
+        return self._parse_battery_from_text(
+            visible_text
+        )
+
+    def _parse_battery_from_text(
+        self,
+        text: str,
+    ) -> float | None:
+
+        patterns = [
+            r'\b(\d{2,3}(?:[.,]\d+)?)\s*kwh\b',
+            r'\b(\d{2,3}(?:[.,]\d+)?)\s*kwh\s*\(net',
+        ]
+
+        for pattern in patterns:
+            match = re.search(
+                pattern,
+                text,
+                flags=re.IGNORECASE,
+            )
+
+            if match:
+                value = float(
+                    match.group(1).replace(",", ".")
+                )
+
+                if 30 <= value <= 150:
+                    return value
+
+        return None
+
+    def _parse_battery_value(
+        self,
+        value: Any,
+    ) -> float | None:
+
+        if isinstance(value, dict):
+            for key in (
+                "value",
+                "capacity",
+                "kwh",
+                "batteryCapacity",
+            ):
+                if key in value:
+                    result = self._parse_battery_value(
+                        value[key]
+                    )
+
+                    if result is not None:
+                        return result
+
+            return None
+
+        if isinstance(value, (int, float)):
+            number = float(value)
+
+            if 30 <= number <= 150:
+                return number
+
+            # Eventuale valore in Wh.
+            if 30000 <= number <= 150000:
+                return round(number / 1000, 1)
+
+            return None
+
+        if isinstance(value, str):
+            return self._parse_battery_from_text(value)
+
+        return None
+
+    # ------------------------------------------------------------------
+    # POWER
+    # ------------------------------------------------------------------
+
+    def _extract_power(
+        self,
+        title: str,
+        visible_text: str,
+        jsonld_objects: list[Any],
+        next_data: Any,
+    ) -> int | None:
+
+        # 1. Il titolo è molto più affidabile del generico
+        # campo potenza mostrato dalla lista AutoScout24.
+        hp = self._parse_hp_from_text(title)
+
+        if hp is not None:
+            return hp
+
+        # 2. kW nel titolo.
+        kw = self._parse_kw_from_text(title)
+
+        if kw is not None:
+            return self._kw_to_hp(kw)
+
+        # 3. JSON-LD.
+        objects = list(jsonld_objects)
+
+        if next_data is not None:
+            objects.append(next_data)
+
+        candidates = self._find_values_by_keys(
+            objects,
+            {
+                "power",
+                "powerkw",
+                "enginepower",
+                "maxpower",
+                "maximumPower",
+            },
+        )
+
+        for candidate in candidates:
+            hp = self._parse_power_value(candidate)
+
+            if hp is not None:
+                return hp
+
+        # 4. Testo completo, ma solo cercando espressioni
+        # esplicite di potenza.
+        hp = self._parse_hp_from_text(
+            visible_text
+        )
+
+        if hp is not None:
+            return hp
+
+        kw = self._parse_kw_from_text(
+            visible_text
+        )
+
+        if kw is not None:
+            return self._kw_to_hp(kw)
+
+        return None
+
+    def _parse_hp_from_text(
+        self,
+        text: str,
+    ) -> int | None:
+
+        patterns = [
+            r'(\d{2,3})\s*(?:cv|CV)\b',
+            r'(\d{2,3})\s*(?:cavalli)\b',
+        ]
+
+        for pattern in patterns:
+            matches = re.findall(
+                pattern,
+                text,
+                flags=re.IGNORECASE,
+            )
+
+            for match in matches:
+                hp = int(match)
+
+                if 50 <= hp <= 500:
+                    return hp
+
+        return None
+
+    def _parse_kw_from_text(
+        self,
+        text: str,
+    ) -> float | None:
+
+        matches = re.findall(
+            r'(\d{2,3}(?:[.,]\d+)?)\s*kW\b',
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        for match in matches:
+            kw = float(
+                match.replace(",", ".")
+            )
+
+            if 30 <= kw <= 400:
+                return kw
+
+        return None
+
+    def _kw_to_hp(
+        self,
+        kw: float,
+    ) -> int:
+
+        # 1 kW = 1.35962 CV
+        return round(kw * 1.35962)
+
+    def _parse_power_value(
+        self,
+        value: Any,
+    ) -> int | None:
+
+        if isinstance(value, dict):
+
+            for key in (
+                "horsepower",
+                "hp",
+                "cv",
+            ):
+                if key in value:
+                    hp = self._parse_hp_from_text(
+                        str(value[key])
+                    )
+
+                    if hp is not None:
+                        return hp
+
+            for key in (
+                "kw",
+                "kW",
+                "powerKw",
+            ):
+                if key in value:
+                    try:
+                        kw = float(value[key])
+                        return self._kw_to_hp(kw)
+                    except Exception:
+                        pass
+
+            for child in value.values():
+                result = self._parse_power_value(
+                    child
+                )
+
+                if result is not None:
+                    return result
+
+            return None
+
+        if isinstance(value, (int, float)):
+            number = float(value)
+
+            # Qui assumiamo kW per valori realistici
+            # dell'ID.3.
+            if 30 <= number <= 400:
+                return self._kw_to_hp(number)
+
+            return None
+
+        if isinstance(value, str):
+            hp = self._parse_hp_from_text(value)
+
+            if hp is not None:
+                return hp
+
+            kw = self._parse_kw_from_text(value)
+
+            if kw is not None:
+                return self._kw_to_hp(kw)
+
+        return None
+
+    # ------------------------------------------------------------------
+    # DESCRIPTION
+    # ------------------------------------------------------------------
+
+    def _extract_description(
+        self,
+        soup: BeautifulSoup,
+        jsonld_objects: list[Any],
+        next_data: Any,
+    ) -> str:
+
+        for obj in jsonld_objects:
+
+            if not isinstance(obj, dict):
+                continue
+
+            value = obj.get("description")
+
+            if isinstance(value, str):
+                value = self._clean_text(value)
+
+                if len(value) > 20:
+                    return value
+
+        # Cerca elementi tipici della descrizione.
+        selectors = [
+            '[data-testid*="description" i]',
+            '[class*="description" i]',
+        ]
+
+        for selector in selectors:
+            try:
+                element = soup.select_one(selector)
+
+                if element:
+                    text = self._clean_text(
+                        element.get_text(" ", strip=True)
+                    )
+
+                    if len(text) > 20:
+                        return text
+
+            except Exception:
+                continue
+
+        return ""
+
+    # ------------------------------------------------------------------
+    # SELLER
+    # ------------------------------------------------------------------
+
+    def _extract_seller(
+        self,
+        soup: BeautifulSoup,
+        jsonld_objects: list[Any],
+        next_data: Any,
+    ) -> str:
+
+        for obj in jsonld_objects:
+
+            if not isinstance(obj, dict):
+                continue
+
+            seller = obj.get("seller")
+
+            if isinstance(seller, dict):
+                name = seller.get("name")
+
+                if isinstance(name, str):
+                    name = self._clean_text(name)
+
+                    if name:
+                        return name
+
+        selectors = [
+            '[data-testid*="seller" i]',
+            '[data-testid*="dealer" i]',
+            '[class*="seller" i]',
+            '[class*="dealer" i]',
+        ]
+
+        for selector in selectors:
+            try:
+                element = soup.select_one(selector)
+
+                if element:
+                    text = self._clean_text(
+                        element.get_text(" ", strip=True)
+                    )
+
+                    if text:
+                        return text
+
+            except Exception:
+                continue
+
+        return ""
+
+    # ------------------------------------------------------------------
+    # EQUIPMENT
+    # ------------------------------------------------------------------
+
+    def _extract_equipment(
+        self,
+        soup: BeautifulSoup,
+        visible_text: str,
+    ) -> str:
+
+        pieces: list[str] = []
+
+        selectors = [
+            '[data-testid*="equipment" i]',
+            '[data-testid*="equip" i]',
+            '[class*="equipment" i]',
+            '[class*="equip" i]',
+        ]
+
+        for selector in selectors:
+            try:
+                elements = soup.select(selector)
+
+                for element in elements:
+                    text = self._clean_text(
+                        element.get_text(" ", strip=True)
+                    )
+
+                    if text and text not in pieces:
+                        pieces.append(text)
+
+            except Exception:
+                continue
+
+        if pieces:
+            return " | ".join(pieces)
+
+        # Fallback: restituiamo solo le righe del testo che
+        # sembrano riferirsi all'equipaggiamento.
+        equipment_keywords = [
+            "radio",
+            "display",
+            "touchscreen",
+            "schermo",
+            "navigazione",
+            "adaptive cruise",
+            "climatizzatore",
+            "telecamera",
+            "sedili riscaldati",
+            "carica",
+            "park assist",
+            "fari",
+            "led",
+        ]
+
+        lines = []
+
+        for line in visible_text.splitlines():
+            normalized = line.lower()
+
+            if any(
+                keyword in normalized
+                for keyword in equipment_keywords
+            ):
+                clean = self._clean_text(line)
+
+                if clean:
+                    lines.append(clean)
+
+        return " | ".join(
+            dict.fromkeys(lines)
+        )
+
+    # ------------------------------------------------------------------
+    # INFOTAINMENT 12.9"
+    # ------------------------------------------------------------------
+
+    def _detect_129_infotainment(
+        self,
+        title: str,
+        description: str,
+        equipment: str,
+        visible_text: str,
+    ) -> tuple[bool | None, str]:
+
+        combined = " ".join(
+            [
+                title,
+                description,
+                equipment,
+                visible_text,
+            ]
+        )
+
+        # Normalizzazione minima.
+        normalized = combined.replace(
+            "″",
+            '"',
+        ).replace(
+            "”",
+            '"',
+        ).replace(
+            "’",
+            "'",
+        )
+
+        # Prima cerchiamo esplicitamente 12.9".
+        patterns_129 = [
+            r'\b12[.,]9\s*(?:["″]|pollici|inch)',
+            r'\b12[.,]9\s*["″]',
+            r'\b12[.,]9\s*pollici',
+            r'\b12[.,]9\s*inch',
+            r'\b12[.,]9\s*\'\'',
+            r'32[.,]8\s*cm\s*\(\s*12[.,]9',
+        ]
+
+        for pattern in patterns_129:
+            match = re.search(
+                pattern,
+                normalized,
+                flags=re.IGNORECASE,
+            )
+
+            if match:
+                snippet = self._extract_evidence_snippet(
+                    normalized,
+                    match.start(),
+                    match.end(),
+                )
+
+                return True, snippet
+
+        # Poi cerchiamo esplicitamente 12".
+        # Attenzione: non basta trovare "12", deve essere
+        # associato a display/schermo/touchscreen.
+        patterns_12 = [
+            r'\b12\s*(?:["″]|pollici|inch)',
+            r'\b12\s*["″]',
+            r'\b12\s*pollici',
+            r'\b12\s*inch',
+            r'30[.,]5\s*cm\s*\(\s*12',
+        ]
+
+        for pattern in patterns_12:
+            match = re.search(
+                pattern,
+                normalized,
+                flags=re.IGNORECASE,
+            )
+
+            if match:
+
+                start = max(
+                    0,
+                    match.start() - 100,
+                )
+
+                end = min(
+                    len(normalized),
+                    match.end() + 100,
+                )
+
+                context = normalized[
+                    start:end
+                ].lower()
+
+                infotainment_words = [
+                    "display",
+                    "schermo",
+                    "touchscreen",
+                    "touch screen",
+                    "radio",
+                    "ready 2 discover",
+                    "ready2discover",
+                ]
+
+                if any(
+                    word in context
+                    for word in infotainment_words
+                ):
+                    snippet = self._extract_evidence_snippet(
+                        normalized,
+                        match.start(),
+                        match.end(),
+                    )
+
+                    return False, snippet
+
+        # Nessuna informazione sufficientemente esplicita.
+        return None, ""
+
+    def _extract_evidence_snippet(
+        self,
+        text: str,
+        start: int,
+        end: int,
+    ) -> str:
+
+        left = max(
+            0,
+            start - 100,
+        )
+
+        right = min(
+            len(text),
+            end + 150,
+        )
+
+        snippet = text[left:right]
+
+        return self._clean_text(snippet)
+
+    # ------------------------------------------------------------------
+    # HELPERS
+    # ------------------------------------------------------------------
+
+    def _extract_title(
+        self,
+        soup: BeautifulSoup,
+        jsonld_objects: list[Any],
+        next_data: Any,
+    ) -> str:
+
+        # JSON-LD
+        for obj in jsonld_objects:
+
+            if not isinstance(obj, dict):
+                continue
+
+            name = obj.get("name")
+
+            if isinstance(name, str):
+                name = self._clean_text(name)
+
+                if name:
+                    return name
+
+        # <h1>
+        h1 = soup.find("h1")
+
+        if h1:
+            title = self._clean_text(
+                h1.get_text(" ", strip=True)
+            )
+
+            if title:
+                return title
+
+        # title HTML
+        if soup.title:
+            title = self._clean_text(
+                soup.title.get_text(
+                    " ",
+                    strip=True,
+                )
+            )
+
+            if title:
+                return title
+
+        return "Volkswagen ID.3"
+
+    def _get_visible_text(
+        self,
+        soup: BeautifulSoup,
+    ) -> str:
+
+        for element in soup(
+            [
+                "script",
+                "style",
+                "noscript",
+                "svg",
+            ]
+        ):
+            element.decompose()
+
+        return self._clean_text(
+            soup.get_text(
+                "\n",
+                strip=True,
+            )
         )
 
     @staticmethod
-    def _parse_thousands_number(
-        value,
-    ):
-        """
-        Interpreta correttamente numeri italiani usati per il
-        chilometraggio.
+    def _clean_text(
+        value: str,
+    ) -> str:
 
-        Esempi:
-            26.173 -> 26173
-            40.698 -> 40698
-            7.910  -> 7910
-            7910   -> 7910
-        """
+        return re.sub(
+            r"\s+",
+            " ",
+            value or "",
+        ).strip()
+
+    @staticmethod
+    def _parse_integer(
+        value: Any,
+    ) -> int | None:
 
         if value is None:
             return None
 
-        text = str(
-            value
-        ).strip()
+        if isinstance(value, bool):
+            return None
 
-        text = (
-            text.replace(
-                "\u00a0",
-                "",
-            )
-            .replace(
-                " ",
-                "",
-            )
+        if isinstance(value, (int, float)):
+            return int(value)
+
+        text = str(value)
+
+        match = re.search(
+            r'\d[\d\.\s]*',
+            text,
         )
 
-        # Nel contesto del chilometraggio, un punto fra gruppi
-        # di tre cifre è un separatore delle migliaia.
-        if re.fullmatch(
-            r"\d{1,3}(?:\.\d{3})+",
+        if not match:
+            return None
+
+        raw = match.group(0)
+
+        # Migliaia italiane:
+        # 26.173 -> 26173
+        # 40 698 -> 40698
+        raw = raw.replace(
+            ".",
+            "",
+        ).replace(
+            " ",
+            "",
+        )
+
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _parse_european_number(
+        value: str,
+    ) -> float | None:
+
+        if not value:
+            return None
+
+        text = str(value).strip()
+
+        # Rimuove simboli non numerici tranne . e ,
+        text = re.sub(
+            r"[^\d\.,]",
+            "",
             text,
-        ):
-
-            text = text.replace(
-                ".",
-                "",
-            )
-
-        # Stessa cosa per la virgola, nel caso di formato
-        # 26,173.
-        elif re.fullmatch(
-            r"\d{1,3}(?:,\d{3})+",
-            text,
-        ):
-
-            text = text.replace(
-                ",",
-                "",
-            )
-
-        else:
-
-            text = re.sub(
-                r"[^\d]",
-                "",
-                text,
-            )
+        )
 
         if not text:
             return None
 
-        try:
-            return float(
-                text
+        # Caso italiano:
+        # 28.300 -> 28300
+        # 28.300,50 -> 28300.50
+        if "." in text and "," in text:
+            text = text.replace(
+                ".",
+                "",
+            ).replace(
+                ",",
+                ".",
             )
 
-        except ValueError:
-            return None
+        elif "." in text:
+            parts = text.split(".")
 
-    # ------------------------------------------------------------------
-    # Batteria
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _extract_battery(
-        text: str,
-    ):
-
-        matches = BATTERY_RE.findall(
-            text
-        )
-
-        if not matches:
-            return None
-
-        values = [
-            float(x)
-            for x in matches
-        ]
-
-        # Preferiamo valori tipici delle batterie ID.3.
-        preferred = [
-            x
-            for x in values
-            if x in {
-                58,
-                59,
-                62,
-                77,
-                79,
-            }
-        ]
-
-        if preferred:
-            return preferred[0]
-
-        return values[0]
-
-    # ------------------------------------------------------------------
-    # Potenza
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _extract_power(
-        text: str,
-    ):
-
-        matches = POWER_RE.findall(
-            text
-        )
-
-        if not matches:
-            return None
-
-        for number, unit in matches:
-
-            try:
-                value = float(
-                    number.replace(
-                        ",",
-                        ".",
-                    )
-                )
-
-            except ValueError:
-                continue
-
-            unit_lower = unit.lower()
-
-            if unit_lower == "cv":
-                return value
-
-            if unit_lower == "ps":
-                return value
-
-            if unit_lower == "kw":
-                # Conversione approssimata kW -> CV.
-                # 150 kW ≈ 204 CV.
-                return round(
-                    value * 1.35962
-                )
-
-        return None
-
-    # ------------------------------------------------------------------
-    # Anno
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _extract_year(
-        value,
-    ):
-
-        if value is None:
-            return None
-
-        if isinstance(
-            value,
-            dict,
-        ):
-
-            nested = (
-                value.get("year")
-                or value.get("value")
-                or value.get("date")
-            )
-
-            if nested is None:
-                return None
-
-            return AutoScout24Scraper._extract_year(
-                nested
-            )
-
-        text = str(
-            value
-        )
-
-        match = re.search(
-            r"\b(20\d{2})\b",
-            text,
-        )
-
-        if not match:
-            return None
-
-        year = int(
-            match.group(1)
-        )
-
-        if 2015 <= year <= 2035:
-            return year
-
-        return None
-
-    # ------------------------------------------------------------------
-    # Infotainment
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _extract_infotainment(
-        text: str,
-    ):
-
-        # Prima cerchiamo SEMPRE il 12,9".
-        match_129 = (
-            INFOTAINMENT_129_RE.search(
-                text
-            )
-        )
-
-        if match_129:
-
-            evidence = (
-                f"12,9\" trovato: "
-                f"'{match_129.group(0)}'"
-            )
-
-            return (
-                True,
-                evidence,
-            )
-
-        # Se non c'è 12,9", cerchiamo il 12".
-        match_12 = (
-            INFOTAINMENT_12_RE.search(
-                text
-            )
-        )
-
-        if match_12:
-
-            evidence = (
-                f"12\" trovato: "
-                f"'{match_12.group(0)}'"
-            )
-
-            return (
-                False,
-                evidence,
-            )
-
-        # Nessuna informazione sufficiente.
-        return (
-            None,
-            "",
-        )
-
-    # ------------------------------------------------------------------
-    # Conversione numerica generica
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _number(
-        value,
-    ):
-
-        if value is None:
-            return None
-
-        if isinstance(
-            value,
-            (int, float),
-        ):
-            return float(
-                value
-            )
-
-        if isinstance(
-            value,
-            dict,
-        ):
-
-            for key in (
-                "value",
-                "amount",
-                "price",
+            if (
+                len(parts) == 2
+                and len(parts[1]) == 3
             ):
+                text = "".join(parts)
 
-                if key in value:
+        elif "," in text:
+            parts = text.split(",")
 
-                    return (
-                        AutoScout24Scraper._number(
-                            value[key]
-                        )
-                    )
-
-            return None
-
-        s = str(
-            value
-        ).strip()
-
-        s = (
-            s.replace(
-                "\u00a0",
-                "",
-            )
-            .replace(
-                " ",
-                "",
-            )
-        )
-
-        if (
-            "." in s
-            and "," in s
-        ):
-
-            s = s.replace(
-                ".",
-                "",
-            )
-
-            s = s.replace(
-                ",",
-                ".",
-            )
-
-        elif "," in s:
-
-            s = s.replace(
-                ",",
-                ".",
-            )
-
-        elif s.count(".") > 1:
-
-            s = s.replace(
-                ".",
-                "",
-            )
-
-        match = re.search(
-            r"\d+(?:\.\d+)?",
-            s,
-        )
-
-        if not match:
-            return None
+            if (
+                len(parts) == 2
+                and len(parts[1]) == 3
+            ):
+                text = "".join(parts)
+            else:
+                text = text.replace(
+                    ",",
+                    ".",
+                )
 
         try:
-
-            return float(
-                match.group()
-            )
+            return float(text)
 
         except ValueError:
             return None
 
-    # ------------------------------------------------------------------
-    # ID annuncio
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_listing_url(
+        url: str,
+    ) -> str | None:
+
+        if not url:
+            return None
+
+        url = url.strip()
+
+        if url.startswith("/"):
+            url = urljoin(
+                AutoScout24Scraper.BASE_URL,
+                url,
+            )
+
+        # Rimuove querystring e fragment.
+        url = url.split("?", 1)[0]
+        url = url.split("#", 1)[0]
+
+        if not AutoScout24Scraper._looks_like_listing_url(
+            url
+        ):
+            return None
+
+        return url
 
     @staticmethod
-    def _listing_id(
+    def _looks_like_listing_url(
+        url: str,
+    ) -> bool:
+
+        return (
+            "autoscout24.it/offerta/"
+            in url
+            and len(url) > 40
+        )
+
+    @staticmethod
+    def _looks_like_search_page_url(
+        url: str,
+    ) -> bool:
+
+        return (
+            "autoscout24.it/lst/"
+            in url
+        )
+
+    @staticmethod
+    def _make_listing_id(
         url: str,
     ) -> str:
 
-        return hashlib.sha256(
-            url.encode(
-                "utf-8"
-            )
+        return hashlib.sha1(
+            url.encode("utf-8")
         ).hexdigest()[:16]
-
-    # ------------------------------------------------------------------
-    # Deduplicazione
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _deduplicate(
-        items,
-    ):
-
-        unique = {}
-
-        for item in items:
-
-            listing_id = item.get(
-                "listing_id"
-            )
-
-            if not listing_id:
-                continue
-
-            if (
-                listing_id
-                not in unique
-            ):
-
-                unique[
-                    listing_id
-                ] = item
-
-                continue
-
-            current = unique[
-                listing_id
-            ]
-
-            current_score = sum(
-                1
-                for value
-                in current.values()
-                if value
-                not in (
-                    None,
-                    "",
-                )
-            )
-
-            new_score = sum(
-                1
-                for value
-                in item.values()
-                if value
-                not in (
-                    None,
-                    "",
-                )
-            )
-
-            if new_score > current_score:
-
-                unique[
-                    listing_id
-                ] = item
-
-        return list(
-            unique.values()
-        )

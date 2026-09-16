@@ -216,6 +216,10 @@ def main() -> None:
             "battery_kwh",
             "power_hp",
             "seller",
+            "equipment",
+            "infotainment_129_candidate",
+            "confidence_score",
+            "classification_evidence",
         ]
 
         available_columns = [

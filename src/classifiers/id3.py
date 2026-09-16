@@ -404,14 +404,15 @@ def classify_listing(
     # Infotainment
     # --------------------------------------------------------
 
+  
     scraper_candidate = item.get(
         "infotainment_129_candidate"
     )
-
+    
     scraper_evidence = _clean_text(
         item.get("classification_evidence")
     )
-
+    
     (
         infotainment_candidate,
         infotainment_score,
@@ -419,6 +420,41 @@ def classify_listing(
     ) = _classify_infotainment_129(
         text
     )
+    
+    # --------------------------------------------------------
+    # Manteniamo l'evidenza trovata direttamente dallo scraper
+    # --------------------------------------------------------
+    
+    if scraper_candidate is True:
+        infotainment_candidate = True
+    
+        if scraper_evidence:
+            infotainment_evidence.insert(
+                0,
+                scraper_evidence,
+            )
+    
+        infotainment_score = max(
+            infotainment_score,
+            70,
+        )
+    
+    elif (
+        scraper_candidate is False
+        and infotainment_candidate is None
+    ):
+        infotainment_candidate = False
+    
+        if scraper_evidence:
+            infotainment_evidence.insert(
+                0,
+                scraper_evidence,
+            )
+    
+        infotainment_score = max(
+            infotainment_score,
+            60,
+        )
 
     if scraper_candidate is True:
         infotainment_candidate = True

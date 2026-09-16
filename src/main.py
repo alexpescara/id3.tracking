@@ -162,6 +162,12 @@ def main() -> None:
         for item in listings
     ]
 
+    for item in classified:
+        item.setdefault(
+            "equipment",
+            "",
+        )
+
     df = pd.DataFrame(
         classified
     )

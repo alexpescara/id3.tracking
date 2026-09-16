@@ -404,6 +404,14 @@ def classify_listing(
     # Infotainment
     # --------------------------------------------------------
 
+    scraper_candidate = item.get(
+        "infotainment_129_candidate"
+    )
+
+    scraper_evidence = _clean_text(
+        item.get("classification_evidence")
+    )
+
     (
         infotainment_candidate,
         infotainment_score,

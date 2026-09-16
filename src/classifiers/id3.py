@@ -420,6 +420,37 @@ def classify_listing(
         text
     )
 
+    if scraper_candidate is True:
+        infotainment_candidate = True
+    
+        if scraper_evidence:
+            infotainment_evidence.insert(
+                0,
+                scraper_evidence,
+            )
+    
+        infotainment_score = max(
+            infotainment_score,
+            70,
+        )
+    
+    elif (
+        scraper_candidate is False
+        and infotainment_candidate is None
+    ):
+        infotainment_candidate = False
+    
+        if scraper_evidence:
+            infotainment_evidence.insert(
+                0,
+                scraper_evidence,
+            )
+    
+        infotainment_score = max(
+            infotainment_score,
+            60,
+        )
+
     # --------------------------------------------------------
     # Restyling
     # --------------------------------------------------------

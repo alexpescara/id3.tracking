@@ -70,6 +70,43 @@ jobs:
           echo "=== DIMENSIONI FILE ==="
           wc -c data/raw/debug_detail.txt data/raw/debug_detail.html
       
+      - name: Analizza HTML dettaglio
+        run: |
+          echo "=== RICERCA NELL'HTML ==="
+
+          grep -oiEn \
+            "12[,.]9|12 pollici|10[,.]25|infotainment|display|touchscreen|schermo|ready 2 discover" \
+            data/raw/debug_detail.html \
+            | head -n 100 || true
+
+          echo ""
+          echo "=== JSON-LD ==="
+
+          python - <<'PY'
+          from bs4 import BeautifulSoup
+
+          path = "data/raw/debug_detail.html"
+
+          with open(path, "r", encoding="utf-8") as f:
+              html = f.read()
+
+          soup = BeautifulSoup(html, "html.parser")
+
+          scripts = soup.find_all(
+              "script",
+              type="application/ld+json",
+          )
+
+          print(f"JSON-LD trovati: {len(scripts)}")
+
+          for i, script in enumerate(scripts):
+              text = script.get_text(strip=True)
+
+              print()
+              print(f"--- JSON-LD {i + 1} ---")
+              print(text[:5000])
+          PY
+      
       - name: Run scraper
         run: python -m src.main
 

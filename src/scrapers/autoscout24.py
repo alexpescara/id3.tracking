@@ -1446,6 +1446,7 @@ class AutoScout24Scraper:
                 title or "",
                 description or "",
                 equipment or "",
+                visible_text or "",
             ]
         )
 

@@ -52,7 +52,24 @@ jobs:
               enabled: true
               search_url: "https://www.autoscout24.it/lst/volkswagen/id.3?atype=C&cy=I&damaged_listing=exclude&desc=0&fregfrom=2024&powertype=kw"
           EOF
+      
+      - name: Debug dettaglio AutoScout24
+        run: |
+          python debug_detail.py
 
+          echo ""
+          echo "=== RICERCA 12,9 / INFOTAINMENT ==="
+
+          if [ -f data/raw/debug_detail.txt ]; then
+            grep -inE "12[,.]9|12 pollici|infotainment|display|schermo|touchscreen|ready 2 discover" \
+              data/raw/debug_detail.txt \
+              | head -n 100 || true
+          fi
+
+          echo ""
+          echo "=== DIMENSIONI FILE ==="
+          wc -c data/raw/debug_detail.txt data/raw/debug_detail.html
+      
       - name: Run scraper
         run: python -m src.main
 

@@ -72,39 +72,89 @@ jobs:
       
       - name: Analizza HTML dettaglio
         run: |
-          echo "=== RICERCA NELL'HTML ==="
-
-          grep -oiEn \
-            "12[,.]9|12 pollici|10[,.]25|infotainment|display|touchscreen|schermo|ready 2 discover" \
-            data/raw/debug_detail.html \
-            | head -n 100 || true
-
-          echo ""
-          echo "=== JSON-LD ==="
+          echo "=== RICERCA 12,9 / 12.9 NELL'HTML ==="
 
           python - <<'PY'
-          from bs4 import BeautifulSoup
+          from pathlib import Path
+          import re
 
-          path = "data/raw/debug_detail.html"
+          path = Path("data/raw/debug_detail.html")
+          html = path.read_text(encoding="utf-8", errors="ignore")
 
-          with open(path, "r", encoding="utf-8") as f:
-              html = f.read()
+          patterns = [
+              r"12[,.]9",
+              r"12[,.]9[^<]{0,100}",
+              r".{0,300}12[,.]9.{0,500}",
+          ]
 
-          soup = BeautifulSoup(html, "html.parser")
-
-          scripts = soup.find_all(
-              "script",
-              type="application/ld+json",
-          )
-
-          print(f"JSON-LD trovati: {len(scripts)}")
-
-          for i, script in enumerate(scripts):
-              text = script.get_text(strip=True)
-
+          for pattern in patterns:
               print()
-              print(f"--- JSON-LD {i + 1} ---")
-              print(text[:5000])
+              print(f"--- PATTERN: {pattern} ---")
+
+              matches = list(
+                  re.finditer(
+                      pattern,
+                      html,
+                      re.IGNORECASE,
+                      re.DOTALL,
+                  )
+              )
+
+              print(f"Occorrenze: {len(matches)}")
+
+              for i, match in enumerate(matches[:20]):
+                  start = max(0, match.start() - 500)
+                  end = min(len(html), match.end() + 1000)
+
+                  print()
+                  print(f"### OCCORRENZA {i + 1} ###")
+                  print(
+                      html[start:end]
+                      .replace("\\u002F", "/")
+                      .replace("\\u0022", '"')
+                  )
+
+          print()
+          print("=== PAROLE TECNICHE ===")
+
+          for term in [
+              "infotainment",
+              "schermo",
+              "display",
+              "touchscreen",
+              "ready 2 discover",
+              "12 pollici",
+              "10,25",
+              "10.25",
+          ]:
+              matches = list(
+                  re.finditer(
+                      re.escape(term),
+                      html,
+                      re.IGNORECASE,
+                  )
+              )
+
+              print(
+                  f"{term}: {len(matches)} occorrenze"
+              )
+
+              for match in matches[:3]:
+                  start = max(
+                      0,
+                      match.start() - 300,
+                  )
+                  end = min(
+                      len(html),
+                      match.end() + 500,
+                  )
+
+                  print(
+                      html[start:end]
+                      .replace("\\u002F", "/")
+                      .replace("\\u0022", '"')
+                  )
+                  print("---")
           PY
       
       - name: Run scraper

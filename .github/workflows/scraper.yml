@@ -79,45 +79,65 @@ jobs:
           import re
 
           path = Path("data/raw/debug_detail.html")
-          html = path.read_text(encoding="utf-8", errors="ignore")
+          html = path.read_text(
+              encoding="utf-8",
+              errors="ignore",
+          )
 
-          patterns = [
-              r"12[,.]9",
-              r"12[,.]9[^<]{0,100}",
-              r".{0,300}12[,.]9.{0,500}",
-          ]
-
-          for pattern in patterns:
+          def show_matches(pattern, label, limit=10):
               print()
-              print(f"--- PATTERN: {pattern} ---")
+              print(f"--- {label} ---")
 
               matches = list(
                   re.finditer(
                       pattern,
                       html,
-                      re.IGNORECASE,
-                      re.DOTALL,
+                      re.IGNORECASE | re.DOTALL,
                   )
               )
 
               print(f"Occorrenze: {len(matches)}")
 
-              for i, match in enumerate(matches[:20]):
-                  start = max(0, match.start() - 500)
-                  end = min(len(html), match.end() + 1000)
+              for i, match in enumerate(matches[:limit]):
+                  start = max(
+                      0,
+                      match.start() - 500,
+                  )
+                  end = min(
+                      len(html),
+                      match.end() + 1000,
+                  )
+
+                  context = html[start:end]
+
+                  context = (
+                      context
+                      .replace("\\u002F", "/")
+                      .replace("\\u0022", '"')
+                      .replace("\\u0027", "'")
+                      .replace("\\/", "/")
+                  )
 
                   print()
                   print(f"### OCCORRENZA {i + 1} ###")
-                  print(
-                      html[start:end]
-                      .replace("\\u002F", "/")
-                      .replace("\\u0022", '"')
-                  )
+                  print(context)
+
+          show_matches(
+              r"12[,.]9",
+              "12,9 / 12.9",
+              20,
+          )
+
+          show_matches(
+              r"12[,.]9.{0,500}",
+              "12,9 / 12.9 + contesto",
+              10,
+          )
 
           print()
           print("=== PAROLE TECNICHE ===")
 
-          for term in [
+          technical_terms = [
               "infotainment",
               "schermo",
               "display",
@@ -126,7 +146,9 @@ jobs:
               "12 pollici",
               "10,25",
               "10.25",
-          ]:
+          ]
+
+          for term in technical_terms:
               matches = list(
                   re.finditer(
                       re.escape(term),
@@ -135,26 +157,39 @@ jobs:
                   )
               )
 
+              print()
               print(
-                  f"{term}: {len(matches)} occorrenze"
+                  f"--- {term}: "
+                  f"{len(matches)} occorrenze ---"
               )
 
-              for match in matches[:3]:
+              for i, match in enumerate(
+                  matches[:3]
+              ):
                   start = max(
                       0,
                       match.start() - 300,
                   )
                   end = min(
                       len(html),
-                      match.end() + 500,
+                      match.end() + 700,
+                  )
+
+                  context = html[start:end]
+
+                  context = (
+                      context
+                      .replace("\\u002F", "/")
+                      .replace("\\u0022", '"')
+                      .replace("\\u0027", "'")
+                      .replace("\\/", "/")
                   )
 
                   print(
-                      html[start:end]
-                      .replace("\\u002F", "/")
-                      .replace("\\u0022", '"')
+                      f"\n### {term} "
+                      f"occorrenza {i + 1} ###"
                   )
-                  print("---")
+                  print(context)
           PY
       
       - name: Run scraper

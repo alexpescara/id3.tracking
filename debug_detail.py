@@ -6,13 +6,34 @@ import json
 URL = "https://www.autoscout24.it/annunci/volkswagen-id-3-58-kwh-pro-performance-204cv-elettrica-nero-cat_ma74mo75602-3f34b9ab-81b6-4d5a-8264-5a61a4184ba5"
 
 
+SEARCH_TERMS = [
+    "12,9",
+    "12.9",
+    "infotainment",
+    "display",
+    "screen",
+    "schermo",
+    "touchscreen",
+    "ready 2 discover",
+    "ready2discover",
+    "equipment",
+    "equipaggiamento",
+    "optional",
+    "multimedia",
+    "entertainment",
+]
+
+
 def count_and_print(text, keyword):
     count = text.lower().count(keyword.lower())
     print(f"{keyword}: {count}")
 
 
 with sync_playwright() as p:
-    browser = p.chromium.launch(headless=True)
+
+    browser = p.chromium.launch(
+        headless=True
+    )
 
     page = browser.new_page(
         viewport={
@@ -20,6 +41,117 @@ with sync_playwright() as p:
             "height": 2000,
         }
     )
+
+    # ============================================================
+    # INTERCETTAZIONE NETWORK
+    # ============================================================
+
+    network_matches = []
+
+    def handle_response(response):
+
+        try:
+            request = response.request
+
+            resource_type = request.resource_type
+
+            if resource_type not in (
+                "xhr",
+                "fetch",
+            ):
+                return
+
+            url = response.url
+
+            # Evitiamo file statici ovvi.
+            lower_url = url.lower()
+
+            if any(
+                extension in lower_url
+                for extension in [
+                    ".js",
+                    ".css",
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
+                    ".webp",
+                    ".svg",
+                    ".woff",
+                    ".woff2",
+                    ".gif",
+                ]
+            ):
+                return
+
+            content_type = (
+                response.headers.get(
+                    "content-type",
+                    "",
+                )
+            )
+
+            # Proviamo a leggere solamente le risposte
+            # che potrebbero contenere dati.
+            try:
+                body = response.text()
+            except Exception:
+                return
+
+            if not body:
+                return
+
+            body_lower = body.lower()
+
+            matched_terms = []
+
+            for term in SEARCH_TERMS:
+                if term.lower() in body_lower:
+                    matched_terms.append(term)
+
+            # Cerchiamo anche URL potenzialmente interessanti.
+            url_terms = [
+                "equipment",
+                "vehicle",
+                "detail",
+                "listing",
+                "offer",
+                "advert",
+                "vehicledata",
+                "vehicle-data",
+                "api",
+            ]
+
+            interesting_url = any(
+                term in lower_url
+                for term in url_terms
+            )
+
+            if matched_terms or interesting_url:
+
+                network_matches.append(
+                    {
+                        "url": url,
+                        "resource_type": resource_type,
+                        "content_type": content_type,
+                        "status": response.status,
+                        "matched_terms": matched_terms,
+                        "body": body,
+                    }
+                )
+
+        except Exception:
+            # Una singola risposta problematica non deve
+            # interrompere il debug.
+            pass
+
+    page.on(
+        "response",
+        handle_response,
+    )
+
+    # ============================================================
+    # APERTURA PAGINA
+    # ============================================================
 
     print("Apro la pagina...")
 
@@ -31,37 +163,50 @@ with sync_playwright() as p:
 
     print("Pagina caricata.")
 
-    # Attesa iniziale per permettere al sito di completare
-    # il caricamento dei contenuti dinamici.
+    # Aspettiamo il caricamento iniziale.
     page.wait_for_timeout(5000)
 
     # ============================================================
-    # SCROLL PROGRESSIVO
+    # SCROLL
     # ============================================================
 
     print("\n=== SCROLL PROGRESSIVO ===")
 
     for i in range(8):
-        print(f"Scroll {i + 1}/8")
 
-        page.mouse.wheel(0, 1500)
+        print(
+            f"Scroll {i + 1}/8"
+        )
 
-        page.wait_for_timeout(1500)
+        page.mouse.wheel(
+            0,
+            1500,
+        )
+
+        page.wait_for_timeout(
+            1500
+        )
 
     # Torniamo in cima.
-    page.evaluate("window.scrollTo(0, 0)")
+    page.evaluate(
+        "window.scrollTo(0, 0)"
+    )
 
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(3000)
 
     # ============================================================
-    # ACQUISIZIONE CONTENUTI
+    # CONTENUTI PAGINA
     # ============================================================
 
-    text = page.locator("body").inner_text()
+    text = page.locator(
+        "body"
+    ).inner_text()
 
     html = page.content()
 
-    print("\n=== DIMENSIONI PAGINA ===")
+    print(
+        "\n=== DIMENSIONI PAGINA ==="
+    )
 
     print(
         "Testo visibile:",
@@ -76,86 +221,17 @@ with sync_playwright() as p:
     )
 
     # ============================================================
-    # RICERCA NEL TESTO VISIBILE
+    # RICERCA TESTO VISIBILE
     # ============================================================
 
-    print("\n=== RICERCA NEL TESTO VISIBILE ===")
+    print(
+        "\n=== RICERCA NEL TESTO VISIBILE ==="
+    )
 
-    keywords = [
-        "12,9",
-        "12.9",
-        "infotainment",
-        "display",
-        "schermo",
-        "touchscreen",
-        "ready 2 discover",
-        "ready2discover",
-        "equipaggiamento",
-        "optional",
-    ]
-
-    for keyword in keywords:
-        count_and_print(text, keyword)
-
-    # ============================================================
-    # CONTESTI 12,9 / INFOTAINMENT NEL TESTO VISIBILE
-    # ============================================================
-
-    print("\n=== RICERCA 12,9 / INFOTAINMENT ===")
-
-    search_terms = [
-        "12,9",
-        "12.9",
-        "infotainment",
-        "ready 2 discover",
-        "ready2discover",
-        "touchscreen",
-        "equipaggiamento",
-        "optional",
-    ]
-
-    lower_text = text.lower()
-
-    found_context = False
-
-    for keyword in search_terms:
-        start_pos = 0
-
-        while True:
-            pos = lower_text.find(
-                keyword.lower(),
-                start_pos,
-            )
-
-            if pos == -1:
-                break
-
-            found_context = True
-
-            start = max(
-                0,
-                pos - 300,
-            )
-
-            end = min(
-                len(text),
-                pos + len(keyword) + 500,
-            )
-
-            print(
-                f"\n--- {keyword} ---"
-            )
-
-            print(
-                text[start:end]
-            )
-
-            start_pos = pos + len(keyword)
-
-    if not found_context:
-        print(
-            "Nessun termine interessante trovato "
-            "nel testo visibile."
+    for keyword in SEARCH_TERMS:
+        count_and_print(
+            text,
+            keyword,
         )
 
     # ============================================================
@@ -171,7 +247,9 @@ with sync_playwright() as p:
     # JSON-LD
     # ============================================================
 
-    print("\n=== JSON-LD ===")
+    print(
+        "\n=== JSON-LD ==="
+    )
 
     jsonld_scripts = soup.find_all(
         "script",
@@ -183,82 +261,29 @@ with sync_playwright() as p:
         len(jsonld_scripts),
     )
 
-    for index, script in enumerate(
-        jsonld_scripts,
-        start=1,
-    ):
-        raw = script.string or script.get_text()
-
-        if not raw.strip():
-            continue
-
-        print(
-            f"\n--- JSON-LD #{index} ---"
-        )
-
-        try:
-            data = json.loads(raw)
-
-            pretty = json.dumps(
-                data,
-                ensure_ascii=False,
-                indent=2,
-            )
-
-            print(pretty[:10000])
-
-        except Exception as exc:
-            print(
-                "Errore parsing JSON-LD:",
-                repr(exc),
-            )
-
     # ============================================================
     # NEXT_DATA
     # ============================================================
 
-    print("\n=== RICERCA NEXT_DATA ===")
+    print(
+        "\n=== NEXT_DATA ==="
+    )
 
     next_script = soup.find(
         "script",
         id="__NEXT_DATA__",
     )
 
-    next_data_text = ""
-
     if next_script and next_script.string:
 
-        print("NEXT_DATA trovato.")
-
-        raw_next_data = next_script.string
-
         print(
-            "Dimensione JSON:",
-            len(raw_next_data),
-            "caratteri",
+            "NEXT_DATA trovato."
         )
 
         try:
+
             next_data = json.loads(
-                raw_next_data
-            )
-
-            # Salviamo il NEXT_DATA completo.
-            with open(
-                "data/raw/debug_next_data.json",
-                "w",
-                encoding="utf-8",
-            ) as f:
-                json.dump(
-                    next_data,
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-
-            print(
-                "Salvato: "
-                "data/raw/debug_next_data.json"
+                next_script.string
             )
 
             next_data_text = json.dumps(
@@ -266,110 +291,36 @@ with sync_playwright() as p:
                 ensure_ascii=False,
             )
 
-            # ----------------------------------------------------
-            # Ricerca termini
-            # ----------------------------------------------------
-
             print(
-                "\n=== RICERCA TERMINI NEL NEXT_DATA ==="
+                "Dimensione JSON:",
+                len(next_data_text),
+                "caratteri",
             )
 
-            next_keywords = [
-                "12,9",
-                "12.9",
-                "infotainment",
-                "display",
-                "screen",
-                "schermo",
-                "touchscreen",
-                "ready 2 discover",
-                "ready2discover",
-                "equipment",
-                "equipaggiamento",
-                "optional",
-                "comfort",
-                "technology",
-                "tech",
-            ]
+            for keyword in SEARCH_TERMS:
 
-            for keyword in next_keywords:
                 count_and_print(
                     next_data_text,
                     keyword,
                 )
 
-            # ----------------------------------------------------
-            # Contesti interessanti
-            # ----------------------------------------------------
+            with open(
+                "data/raw/debug_next_data.json",
+                "w",
+                encoding="utf-8",
+            ) as f:
 
-            print(
-                "\n=== CONTESTI INTERESSANTI NEXT_DATA ==="
-            )
-
-            lower_next_data = (
-                next_data_text.lower()
-            )
-
-            context_keywords = [
-                "12,9",
-                "12.9",
-                "infotainment",
-                "ready 2 discover",
-                "ready2discover",
-                "equipment",
-                "equipaggiamento",
-            ]
-
-            found_next_context = False
-
-            for keyword in context_keywords:
-
-                start_pos = 0
-
-                while True:
-
-                    pos = lower_next_data.find(
-                        keyword.lower(),
-                        start_pos,
-                    )
-
-                    if pos == -1:
-                        break
-
-                    found_next_context = True
-
-                    start = max(
-                        0,
-                        pos - 500,
-                    )
-
-                    end = min(
-                        len(next_data_text),
-                        pos + len(keyword) + 1000,
-                    )
-
-                    print(
-                        f"\n--- {keyword} ---"
-                    )
-
-                    print(
-                        next_data_text[start:end]
-                    )
-
-                    start_pos = (
-                        pos + len(keyword)
-                    )
-
-            if not found_next_context:
-                print(
-                    "Nessun termine interessante "
-                    "trovato nel NEXT_DATA."
+                json.dump(
+                    next_data,
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
                 )
 
         except Exception as exc:
 
             print(
-                "Errore parsing NEXT_DATA:",
+                "Errore NEXT_DATA:",
                 repr(exc),
             )
 
@@ -380,7 +331,126 @@ with sync_playwright() as p:
         )
 
     # ============================================================
-    # SALVATAGGIO TESTO E HTML
+    # RISULTATI NETWORK
+    # ============================================================
+
+    print(
+        "\n"
+        + "=" * 70
+    )
+
+    print(
+        "=== RISPOSTE NETWORK INTERESSANTI ==="
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        "Risposte trovate:",
+        len(network_matches),
+    )
+
+    # Salviamo TUTTI i risultati interessanti
+    # in un file JSON per poterli analizzare.
+    network_output = []
+
+    for index, item in enumerate(
+        network_matches,
+        start=1,
+    ):
+
+        print(
+            f"\n--- RESPONSE #{index} ---"
+        )
+
+        print(
+            "STATUS:",
+            item["status"],
+        )
+
+        print(
+            "TYPE:",
+            item["resource_type"],
+        )
+
+        print(
+            "CONTENT-TYPE:",
+            item["content_type"],
+        )
+
+        print(
+            "URL:",
+            item["url"],
+        )
+
+        print(
+            "TERMINI:",
+            item["matched_terms"],
+        )
+
+        body = item["body"]
+
+        print(
+            "BODY SIZE:",
+            len(body),
+        )
+
+        # Mostriamo solamente una parte della risposta
+        # per evitare un output enorme.
+        preview = body[:5000]
+
+        print(
+            "\nBODY PREVIEW:"
+        )
+
+        print(
+            preview
+        )
+
+        network_output.append(
+            {
+                "url": item["url"],
+                "resource_type": item[
+                    "resource_type"
+                ],
+                "content_type": item[
+                    "content_type"
+                ],
+                "status": item[
+                    "status"
+                ],
+                "matched_terms": item[
+                    "matched_terms"
+                ],
+                "body": body,
+            }
+        )
+
+    with open(
+        "data/raw/debug_network.json",
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            network_output,
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    print(
+        "\nSalvato:"
+    )
+
+    print(
+        "data/raw/debug_network.json"
+    )
+
+    # ============================================================
+    # SALVATAGGIO PAGINA
     # ============================================================
 
     with open(
@@ -388,6 +458,7 @@ with sync_playwright() as p:
         "w",
         encoding="utf-8",
     ) as f:
+
         f.write(text)
 
     with open(
@@ -395,9 +466,12 @@ with sync_playwright() as p:
         "w",
         encoding="utf-8",
     ) as f:
+
         f.write(html)
 
-    print("\n=== FILE GENERATI ===")
+    print(
+        "\n=== FILE GENERATI ==="
+    )
 
     print(
         "data/raw/debug_detail.txt"
@@ -407,11 +481,16 @@ with sync_playwright() as p:
         "data/raw/debug_detail.html"
     )
 
-    if next_data_text:
-        print(
-            "data/raw/debug_next_data.json"
-        )
+    print(
+        "data/raw/debug_next_data.json"
+    )
 
-    print("\nDEBUG COMPLETATO.")
+    print(
+        "data/raw/debug_network.json"
+    )
+
+    print(
+        "\nDEBUG COMPLETATO."
+    )
 
     browser.close()

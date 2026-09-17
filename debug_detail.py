@@ -24,9 +24,213 @@ SEARCH_TERMS = [
 ]
 
 
-def count_and_print(text, keyword):
-    count = text.lower().count(keyword.lower())
-    print(f"{keyword}: {count}")
+network_matches = []
+
+
+def search_recursive(obj, path="root", results=None):
+    """
+    Cerca ricorsivamente nei dati JSON campi o valori
+    interessanti relativi all'equipaggiamento.
+    """
+
+    if results is None:
+        results = []
+
+    if isinstance(obj, dict):
+
+        for key, value in obj.items():
+
+            key_lower = str(key).lower()
+
+            interesting_key = any(
+                term in key_lower
+                for term in [
+                    "equipment",
+                    "equipaggiamento",
+                    "optional",
+                    "infotainment",
+                    "multimedia",
+                    "entertainment",
+                    "comfort",
+                    "safety",
+                    "extra",
+                ]
+            )
+
+            if interesting_key:
+
+                results.append(
+                    {
+                        "path": f"{path}.{key}",
+                        "value": value,
+                    }
+                )
+
+            search_recursive(
+                value,
+                f"{path}.{key}",
+                results,
+            )
+
+    elif isinstance(obj, list):
+
+        for index, value in enumerate(obj):
+
+            search_recursive(
+                value,
+                f"{path}[{index}]",
+                results,
+            )
+
+    return results
+
+
+def handle_response(response):
+
+    try:
+
+        request = response.request
+
+        if request.resource_type not in (
+            "xhr",
+            "fetch",
+        ):
+            return
+
+        url = response.url
+
+        # Ci interessa soprattutto GraphQL di AutoScout24.
+        if "listing-search-api/graphql" not in url:
+            return
+
+        print(
+            "\n[GRAPHQL RESPONSE]"
+        )
+
+        print(
+            "STATUS:",
+            response.status,
+        )
+
+        print(
+            "URL:",
+            url,
+        )
+
+        try:
+            body = response.text()
+        except Exception:
+            return
+
+        if not body:
+            return
+
+        print(
+            "BODY SIZE:",
+            len(body),
+        )
+
+        try:
+
+            data = json.loads(body)
+
+        except Exception as exc:
+
+            print(
+                "JSON non valido:",
+                repr(exc),
+            )
+
+            return
+
+        # --------------------------------------------------------
+        # Salviamo la risposta completa
+        # --------------------------------------------------------
+
+        network_matches.append(
+            {
+                "url": url,
+                "status": response.status,
+                "body": data,
+            }
+        )
+
+        # --------------------------------------------------------
+        # Ricerca testuale
+        # --------------------------------------------------------
+
+        serialized = json.dumps(
+            data,
+            ensure_ascii=False,
+        )
+
+        print(
+            "\n=== TERMINI NELLA RISPOSTA GRAPHQL ==="
+        )
+
+        for term in SEARCH_TERMS:
+
+            count = serialized.lower().count(
+                term.lower()
+            )
+
+            print(
+                f"{term}: {count}"
+            )
+
+        # --------------------------------------------------------
+        # Ricerca strutturale
+        # --------------------------------------------------------
+
+        print(
+            "\n=== CAMPI EQUIPMENT / OPTIONAL ==="
+        )
+
+        results = search_recursive(data)
+
+        print(
+            "Campi interessanti trovati:",
+            len(results),
+        )
+
+        for item in results:
+
+            print(
+                "\nPATH:"
+            )
+
+            print(
+                item["path"]
+            )
+
+            print(
+                "VALUE:"
+            )
+
+            value = item["value"]
+
+            try:
+
+                print(
+                    json.dumps(
+                        value,
+                        ensure_ascii=False,
+                        indent=2,
+                    )[:10000]
+                )
+
+            except Exception:
+
+                print(
+                    repr(value)
+                )
+
+    except Exception as exc:
+
+        print(
+            "Errore gestione response:",
+            repr(exc),
+        )
 
 
 with sync_playwright() as p:
@@ -43,106 +247,8 @@ with sync_playwright() as p:
     )
 
     # ============================================================
-    # INTERCETTAZIONE NETWORK
+    # NETWORK LISTENER
     # ============================================================
-
-    network_matches = []
-
-    def handle_response(response):
-
-        try:
-            request = response.request
-
-            resource_type = request.resource_type
-
-            if resource_type not in (
-                "xhr",
-                "fetch",
-            ):
-                return
-
-            url = response.url
-
-            # Evitiamo file statici ovvi.
-            lower_url = url.lower()
-
-            if any(
-                extension in lower_url
-                for extension in [
-                    ".js",
-                    ".css",
-                    ".png",
-                    ".jpg",
-                    ".jpeg",
-                    ".webp",
-                    ".svg",
-                    ".woff",
-                    ".woff2",
-                    ".gif",
-                ]
-            ):
-                return
-
-            content_type = (
-                response.headers.get(
-                    "content-type",
-                    "",
-                )
-            )
-
-            # Proviamo a leggere solamente le risposte
-            # che potrebbero contenere dati.
-            try:
-                body = response.text()
-            except Exception:
-                return
-
-            if not body:
-                return
-
-            body_lower = body.lower()
-
-            matched_terms = []
-
-            for term in SEARCH_TERMS:
-                if term.lower() in body_lower:
-                    matched_terms.append(term)
-
-            # Cerchiamo anche URL potenzialmente interessanti.
-            url_terms = [
-                "equipment",
-                "vehicle",
-                "detail",
-                "listing",
-                "offer",
-                "advert",
-                "vehicledata",
-                "vehicle-data",
-                "api",
-            ]
-
-            interesting_url = any(
-                term in lower_url
-                for term in url_terms
-            )
-
-            if matched_terms or interesting_url:
-
-                network_matches.append(
-                    {
-                        "url": url,
-                        "resource_type": resource_type,
-                        "content_type": content_type,
-                        "status": response.status,
-                        "matched_terms": matched_terms,
-                        "body": body,
-                    }
-                )
-
-        except Exception:
-            # Una singola risposta problematica non deve
-            # interrompere il debug.
-            pass
 
     page.on(
         "response",
@@ -153,7 +259,9 @@ with sync_playwright() as p:
     # APERTURA PAGINA
     # ============================================================
 
-    print("Apro la pagina...")
+    print(
+        "Apro la pagina..."
+    )
 
     page.goto(
         URL,
@@ -161,16 +269,22 @@ with sync_playwright() as p:
         timeout=60000,
     )
 
-    print("Pagina caricata.")
+    print(
+        "Pagina caricata."
+    )
 
-    # Aspettiamo il caricamento iniziale.
-    page.wait_for_timeout(5000)
+    # Aspettiamo le chiamate iniziali.
+    page.wait_for_timeout(
+        5000
+    )
 
     # ============================================================
     # SCROLL
     # ============================================================
 
-    print("\n=== SCROLL PROGRESSIVO ===")
+    print(
+        "\n=== SCROLL ==="
+    )
 
     for i in range(8):
 
@@ -192,10 +306,12 @@ with sync_playwright() as p:
         "window.scrollTo(0, 0)"
     )
 
-    page.wait_for_timeout(3000)
+    page.wait_for_timeout(
+        5000
+    )
 
     # ============================================================
-    # CONTENUTI PAGINA
+    # PAGINA
     # ============================================================
 
     text = page.locator(
@@ -204,250 +320,22 @@ with sync_playwright() as p:
 
     html = page.content()
 
-    print(
-        "\n=== DIMENSIONI PAGINA ==="
-    )
-
-    print(
-        "Testo visibile:",
-        len(text),
-        "caratteri",
-    )
-
-    print(
-        "HTML:",
-        len(html),
-        "caratteri",
-    )
-
     # ============================================================
-    # RICERCA TESTO VISIBILE
+    # SALVATAGGIO NETWORK COMPLETO
     # ============================================================
-
-    print(
-        "\n=== RICERCA NEL TESTO VISIBILE ==="
-    )
-
-    for keyword in SEARCH_TERMS:
-        count_and_print(
-            text,
-            keyword,
-        )
-
-    # ============================================================
-    # PARSING HTML
-    # ============================================================
-
-    soup = BeautifulSoup(
-        html,
-        "lxml",
-    )
-
-    # ============================================================
-    # JSON-LD
-    # ============================================================
-
-    print(
-        "\n=== JSON-LD ==="
-    )
-
-    jsonld_scripts = soup.find_all(
-        "script",
-        type="application/ld+json",
-    )
-
-    print(
-        "Blocchi JSON-LD trovati:",
-        len(jsonld_scripts),
-    )
-
-    # ============================================================
-    # NEXT_DATA
-    # ============================================================
-
-    print(
-        "\n=== NEXT_DATA ==="
-    )
-
-    next_script = soup.find(
-        "script",
-        id="__NEXT_DATA__",
-    )
-
-    if next_script and next_script.string:
-
-        print(
-            "NEXT_DATA trovato."
-        )
-
-        try:
-
-            next_data = json.loads(
-                next_script.string
-            )
-
-            next_data_text = json.dumps(
-                next_data,
-                ensure_ascii=False,
-            )
-
-            print(
-                "Dimensione JSON:",
-                len(next_data_text),
-                "caratteri",
-            )
-
-            for keyword in SEARCH_TERMS:
-
-                count_and_print(
-                    next_data_text,
-                    keyword,
-                )
-
-            with open(
-                "data/raw/debug_next_data.json",
-                "w",
-                encoding="utf-8",
-            ) as f:
-
-                json.dump(
-                    next_data,
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-
-        except Exception as exc:
-
-            print(
-                "Errore NEXT_DATA:",
-                repr(exc),
-            )
-
-    else:
-
-        print(
-            "NEXT_DATA NON TROVATO."
-        )
-
-    # ============================================================
-    # RISULTATI NETWORK
-    # ============================================================
-
-    print(
-        "\n"
-        + "=" * 70
-    )
-
-    print(
-        "=== RISPOSTE NETWORK INTERESSANTI ==="
-    )
-
-    print(
-        "=" * 70
-    )
-
-    print(
-        "Risposte trovate:",
-        len(network_matches),
-    )
-
-    # Salviamo TUTTI i risultati interessanti
-    # in un file JSON per poterli analizzare.
-    network_output = []
-
-    for index, item in enumerate(
-        network_matches,
-        start=1,
-    ):
-
-        print(
-            f"\n--- RESPONSE #{index} ---"
-        )
-
-        print(
-            "STATUS:",
-            item["status"],
-        )
-
-        print(
-            "TYPE:",
-            item["resource_type"],
-        )
-
-        print(
-            "CONTENT-TYPE:",
-            item["content_type"],
-        )
-
-        print(
-            "URL:",
-            item["url"],
-        )
-
-        print(
-            "TERMINI:",
-            item["matched_terms"],
-        )
-
-        body = item["body"]
-
-        print(
-            "BODY SIZE:",
-            len(body),
-        )
-
-        # Mostriamo solamente una parte della risposta
-        # per evitare un output enorme.
-        preview = body[:5000]
-
-        print(
-            "\nBODY PREVIEW:"
-        )
-
-        print(
-            preview
-        )
-
-        network_output.append(
-            {
-                "url": item["url"],
-                "resource_type": item[
-                    "resource_type"
-                ],
-                "content_type": item[
-                    "content_type"
-                ],
-                "status": item[
-                    "status"
-                ],
-                "matched_terms": item[
-                    "matched_terms"
-                ],
-                "body": body,
-            }
-        )
 
     with open(
-        "data/raw/debug_network.json",
+        "data/raw/debug_network_full.json",
         "w",
         encoding="utf-8",
     ) as f:
 
         json.dump(
-            network_output,
+            network_matches,
             f,
             ensure_ascii=False,
             indent=2,
         )
-
-    print(
-        "\nSalvato:"
-    )
-
-    print(
-        "data/raw/debug_network.json"
-    )
 
     # ============================================================
     # SALVATAGGIO PAGINA
@@ -469,8 +357,72 @@ with sync_playwright() as p:
 
         f.write(html)
 
+    # ============================================================
+    # NEXT_DATA
+    # ============================================================
+
+    soup = BeautifulSoup(
+        html,
+        "lxml",
+    )
+
+    next_script = soup.find(
+        "script",
+        id="__NEXT_DATA__",
+    )
+
+    if next_script and next_script.string:
+
+        try:
+
+            next_data = json.loads(
+                next_script.string
+            )
+
+            with open(
+                "data/raw/debug_next_data.json",
+                "w",
+                encoding="utf-8",
+            ) as f:
+
+                json.dump(
+                    next_data,
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+        except Exception:
+            pass
+
+    # ============================================================
+    # RIEPILOGO
+    # ============================================================
+
     print(
-        "\n=== FILE GENERATI ==="
+        "\n"
+        + "=" * 70
+    )
+
+    print(
+        "=== RIEPILOGO ==="
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        "Risposte GraphQL catturate:",
+        len(network_matches),
+    )
+
+    print(
+        "\nFile generati:"
+    )
+
+    print(
+        "data/raw/debug_network_full.json"
     )
 
     print(
@@ -483,10 +435,6 @@ with sync_playwright() as p:
 
     print(
         "data/raw/debug_next_data.json"
-    )
-
-    print(
-        "data/raw/debug_network.json"
     )
 
     print(

@@ -192,6 +192,9 @@ jobs:
                   print(context)
           PY
       
+      - name: Run detail debug
+        run: python debug_detail.py
+        
       - name: Run scraper
         run: python -m src.main
 

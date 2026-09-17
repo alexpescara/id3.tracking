@@ -195,6 +195,17 @@ jobs:
       - name: Run detail debug
         run: python debug_detail.py
         
+      - name: Upload debug files
+        uses: actions/upload-artifact@v4
+        with:
+          name: autoscout-debug
+          path: |
+            data/raw/debug_network.json
+            data/raw/debug_detail.txt
+            data/raw/debug_detail.html
+            data/raw/debug_next_data.json
+          if-no-files-found: warn
+          
       - name: Run scraper
         run: python -m src.main
 

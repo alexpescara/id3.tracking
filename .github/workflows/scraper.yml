@@ -34,6 +34,9 @@ jobs:
             name: id3-market-monitor
             timezone: Europe/Rome
 
+          database:
+            path: data/id3_tracking.db
+
           scraper:
             headless: true
             timeout_ms: 30000
@@ -52,164 +55,11 @@ jobs:
               enabled: true
               search_url: "https://www.autoscout24.it/lst/volkswagen/id.3?atype=C&cy=I&damaged_listing=exclude&desc=0&fregfrom=2024&powertype=kw"
           EOF
-      
-      - name: Debug dettaglio AutoScout24
-        run: |
-          python debug_detail.py
 
-          echo ""
-          echo "=== RICERCA 12,9 / INFOTAINMENT ==="
-
-          if [ -f data/raw/debug_detail.txt ]; then
-            grep -inE "12[,.]9|12 pollici|infotainment|display|schermo|touchscreen|ready 2 discover" \
-              data/raw/debug_detail.txt \
-              | head -n 100 || true
-          fi
-
-          echo ""
-          echo "=== DIMENSIONI FILE ==="
-          wc -c data/raw/debug_detail.txt data/raw/debug_detail.html
-      
-      - name: Analizza HTML dettaglio
-        run: |
-          echo "=== RICERCA 12,9 / 12.9 NELL'HTML ==="
-
-          python - <<'PY'
-          from pathlib import Path
-          import re
-
-          path = Path("data/raw/debug_detail.html")
-          html = path.read_text(
-              encoding="utf-8",
-              errors="ignore",
-          )
-
-          def show_matches(pattern, label, limit=10):
-              print()
-              print(f"--- {label} ---")
-
-              matches = list(
-                  re.finditer(
-                      pattern,
-                      html,
-                      re.IGNORECASE | re.DOTALL,
-                  )
-              )
-
-              print(f"Occorrenze: {len(matches)}")
-
-              for i, match in enumerate(matches[:limit]):
-                  start = max(
-                      0,
-                      match.start() - 500,
-                  )
-                  end = min(
-                      len(html),
-                      match.end() + 1000,
-                  )
-
-                  context = html[start:end]
-
-                  context = (
-                      context
-                      .replace("\\u002F", "/")
-                      .replace("\\u0022", '"')
-                      .replace("\\u0027", "'")
-                      .replace("\\/", "/")
-                  )
-
-                  print()
-                  print(f"### OCCORRENZA {i + 1} ###")
-                  print(context)
-
-          show_matches(
-              r"12[,.]9",
-              "12,9 / 12.9",
-              20,
-          )
-
-          show_matches(
-              r"12[,.]9.{0,500}",
-              "12,9 / 12.9 + contesto",
-              10,
-          )
-
-          print()
-          print("=== PAROLE TECNICHE ===")
-
-          technical_terms = [
-              "infotainment",
-              "schermo",
-              "display",
-              "touchscreen",
-              "ready 2 discover",
-              "12 pollici",
-              "10,25",
-              "10.25",
-          ]
-
-          for term in technical_terms:
-              matches = list(
-                  re.finditer(
-                      re.escape(term),
-                      html,
-                      re.IGNORECASE,
-                  )
-              )
-
-              print()
-              print(
-                  f"--- {term}: "
-                  f"{len(matches)} occorrenze ---"
-              )
-
-              for i, match in enumerate(
-                  matches[:3]
-              ):
-                  start = max(
-                      0,
-                      match.start() - 300,
-                  )
-                  end = min(
-                      len(html),
-                      match.end() + 700,
-                  )
-
-                  context = html[start:end]
-
-                  context = (
-                      context
-                      .replace("\\u002F", "/")
-                      .replace("\\u0022", '"')
-                      .replace("\\u0027", "'")
-                      .replace("\\/", "/")
-                  )
-
-                  print(
-                      f"\n### {term} "
-                      f"occorrenza {i + 1} ###"
-                  )
-                  print(context)
-          PY
-      
-      - name: Run detail debug
-        run: python debug_detail.py
-        
-      - name: Upload debug files
-        uses: actions/upload-artifact@v4
-        with:
-          name: autoscout-debug
-          path: |
-            data/raw/debug_network.json
-            data/raw/debug_detail.txt
-            data/raw/debug_detail.html
-            data/raw/debug_next_data.json
-          if-no-files-found: warn
-          
       - name: Run scraper
         run: python -m src.main
 
-      - name: Show generated CSV
+      - name: Show generated data
         run: |
           if [ -f data/processed/listings.csv ]; then
             echo "CSV generato correttamente:"
@@ -222,12 +72,21 @@ jobs:
             exit 1
           fi
 
+          if [ -f data/id3_tracking.db ]; then
+            echo ""
+            echo "Database SQLite generato correttamente:"
+            ls -lh data/id3_tracking.db
+          else
+            echo "ERRORE: data/id3_tracking.db non trovato"
+            exit 1
+          fi
+
       - name: Commit results
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add data/processed/listings.csv data/raw/ || true
+          git add data/processed/listings.csv data/id3_tracking.db data/raw/ || true
 
           if git diff --cached --quiet; then
             echo "Nessuna modifica ai risultati."

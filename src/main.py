@@ -6,6 +6,7 @@ import yaml
 
 from src.scrapers.autoscout24 import AutoScout24Scraper
 from src.classifiers.id3 import classify_listing
+from src.database.repository import TrackingRepository
 
 
 def load_config(path: str) -> dict:
@@ -13,19 +14,7 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def apply_filters(
-    df: pd.DataFrame,
-    config: dict,
-) -> pd.DataFrame:
-    """
-    Applica i filtri configurati alla fine dello scraping.
-
-    Filtri attuali:
-    - anno >= min_year
-    - batteria >= min_battery_kwh
-    - prezzo <= max_price_eur
-    """
-
+def apply_filters(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     filters = config.get("filters", {})
 
     min_year = filters.get("min_year")
@@ -35,7 +24,6 @@ def apply_filters(
     if df.empty:
         return df
 
-    # Conversione robusta dei campi numerici
     for column in [
         "price_eur",
         "mileage_km",
@@ -44,10 +32,7 @@ def apply_filters(
         "power_hp",
     ]:
         if column in df.columns:
-            df[column] = pd.to_numeric(
-                df[column],
-                errors="coerce",
-            )
+            df[column] = pd.to_numeric(df[column], errors="coerce")
 
     before = len(df)
 
@@ -71,128 +56,102 @@ def apply_filters(
 
     after = len(df)
 
-    print(
-        "Filtro annunci:"
-        f" {before} -> {after}"
-    )
+    print(f"Filtro annunci: {before} -> {after}")
 
     if min_year is not None:
-        print(
-            f"  Anno minimo: {min_year}"
-        )
-
+        print(f"  Anno minimo: {min_year}")
     if min_battery_kwh is not None:
-        print(
-            f"  Batteria minima: "
-            f"{min_battery_kwh} kWh"
-        )
-
+        print(f"  Batteria minima: {min_battery_kwh} kWh")
     if max_price_eur is not None:
-        print(
-            f"  Prezzo massimo: "
-            f"{max_price_eur} €"
-        )
+        print(f"  Prezzo massimo: {max_price_eur} €")
 
     return df.reset_index(drop=True)
 
 
+def save_to_database(df: pd.DataFrame, config: dict) -> int:
+    database_cfg = config.get("database", {})
+
+    db_path = database_cfg.get(
+        "path",
+        "data/id3_tracking.db",
+    )
+
+    timezone = config.get("project", {}).get(
+        "timezone",
+        "Europe/Rome",
+    )
+
+    repository = TrackingRepository(
+        db_path=db_path,
+        timezone=timezone,
+    )
+
+    if df.empty:
+        print("Database: nessun annuncio da salvare.")
+        return 0
+
+    records = df.where(pd.notna(df), None).to_dict(
+        orient="records"
+    )
+
+    saved = repository.save_listings(
+        records,
+        source="autoscout24",
+    )
+
+    print(f"Database: {saved} annunci salvati.")
+    print(
+        f"Database: {repository.count_listings()} annunci totali."
+    )
+    print(
+        f"Database: {repository.count_snapshots()} rilevazioni storiche."
+    )
+
+    return saved
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--config",
-        default="config.yaml",
-    )
-
-    parser.add_argument(
-        "--headed",
-        action="store_true",
-    )
-
+    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--headed", action="store_true")
     args = parser.parse_args()
 
-    config = load_config(
-        args.config
-    )
-
+    config = load_config(args.config)
     config["scraper"]["headless"] = not args.headed
 
-    source_cfg = config[
-        "sources"
-    ]["autoscout24"]
+    source_cfg = config["sources"]["autoscout24"]
 
-    if not source_cfg.get(
-        "enabled",
-        True,
-    ):
-        print(
-            "AutoScout24 disabilitato."
-        )
+    if not source_cfg.get("enabled", True):
+        print("AutoScout24 disabilitato.")
         return
 
-    # ------------------------------------------------------------
     # SCRAPING
-    # ------------------------------------------------------------
+    scraper = AutoScout24Scraper(config)
+    listings = scraper.search(source_cfg["search_url"])
 
-    scraper = AutoScout24Scraper(
-        config
-    )
-
-    listings = scraper.search(
-        source_cfg["search_url"]
-    )
-
-    print(
-        f"Annunci raccolti dallo scraper: "
-        f"{len(listings)}"
-    )
+    print(f"Annunci raccolti dallo scraper: {len(listings)}")
 
     if not listings:
-        print(
-            "Nessun annuncio raccolto."
-        )
+        print("Nessun annuncio raccolto.")
         return
 
-    # ------------------------------------------------------------
     # CLASSIFICAZIONE
-    # ------------------------------------------------------------
-
     classified = [
         classify_listing(item)
         for item in listings
     ]
 
     for item in classified:
-        item.setdefault(
-            "equipment",
-            "",
-        )
+        item.setdefault("equipment", "")
 
-    df = pd.DataFrame(
-        classified
-    )
+    df = pd.DataFrame(classified)
 
-    # ------------------------------------------------------------
     # FILTRI
-    # ------------------------------------------------------------
+    df = apply_filters(df, config)
 
-    df = apply_filters(
-        df,
-        config,
-    )
-
-    # ------------------------------------------------------------
-    # OUTPUT
-    # ------------------------------------------------------------
-
-    out = Path(
-        "data/processed/listings.csv"
-    )
-
-    out.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    # OUTPUT CSV
+    out = Path("data/processed/listings.csv")
+    out.parent.mkdir(parents=True, exist_ok=True)
 
     df.to_csv(
         out,
@@ -200,19 +159,16 @@ def main() -> None:
         encoding="utf-8-sig",
     )
 
-    print(
-        f"Annunci finali: {len(df)}"
-    )
+    print(f"Annunci finali: {len(df)}")
+    print(f"Output: {out}")
 
-    print(
-        f"Output: {out}"
-    )
+    # DATABASE / STORICO
+    save_to_database(df, config)
 
+    # OUTPUT CONSOLE
     if not df.empty:
         print()
-        print(
-            "Annunci filtrati:"
-        )
+        print("Annunci filtrati:")
 
         columns = [
             "title",
@@ -229,17 +185,11 @@ def main() -> None:
         ]
 
         available_columns = [
-            column
-            for column in columns
-            if column in df.columns
+            column for column in columns if column in df.columns
         ]
 
         print(
-            df[
-                available_columns
-            ].to_string(
-                index=False
-            )
+            df[available_columns].to_string(index=False)
         )
 
 

@@ -2,11 +2,15 @@ project:
   name: id3-market-monitor
   timezone: Europe/Rome
 
+database:
+  path: data/id3_tracking.db
+
 scraper:
   headless: true
   timeout_ms: 30000
   delay_seconds: 2.5
   max_pages: 3
+  max_detail_pages: 30
   user_agent: "ID3-Market-Monitor/0.1 (open-source research project)"
 
 filters:
